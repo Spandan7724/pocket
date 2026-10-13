@@ -1,0 +1,47 @@
+# M0 probe: does the hosted runner give us usable KVM? Replaced by ci.yml in M1.
+name: kvm-probe
+
+on:
+  push:
+    paths:
+      - ".github/workflows/kvm-probe.yml"
+      - "spike/kvm-probe/**"
+  workflow_dispatch:
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Host info
+        run: |
+          uname -a
+          grep -m1 -o -w -E 'vmx|svm' /proc/cpuinfo || echo "no vmx/svm flag in /proc/cpuinfo"
+          ls -l /dev/kvm || true
+          id
+
+      - name: Probe before udev rule
+        continue-on-error: true
+        run: python3 -I spike/kvm-probe/kvm_probe.py
+
+      - name: Grant /dev/kvm to the runner user
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Probe after udev rule
+        run: python3 -I spike/kvm-probe/kvm_probe.py
+
+      - name: cgroup v2 and user delegation
+        continue-on-error: true
+        run: |
+          stat -fc %T /sys/fs/cgroup
+          cat /sys/fs/cgroup/cgroup.controllers
+          cat "/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/cgroup.controllers" || echo "no user@ service cgroup"
+          systemd-run --user --scope -p MemoryMax=64M true && echo "systemd-run --user scope: OK"
