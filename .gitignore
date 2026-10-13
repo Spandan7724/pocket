@@ -1,0 +1,7 @@
+# Rust build output
+/target/
+
+# Local planning docs and agent instructions (kept out of the repo)
+/docs/
+CLAUDE.md
+AGENTS.md
