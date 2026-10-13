@@ -143,7 +143,6 @@ pub fn vmm() -> Result<PathBuf> {
     }
     run(Command::new(env!("CARGO"))
         .current_dir(&src)
-        .env_remove("RUSTUP_TOOLCHAIN")
         .env("CARGO_TARGET_DIR", src.join("target"))
         .args(["build", "--release", "--bin", "cloud-hypervisor"]))?;
     fs::create_dir_all(dest.parent().unwrap())?;
