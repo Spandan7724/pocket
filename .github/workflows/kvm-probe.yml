@@ -13,10 +13,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [ubuntu-latest, ubuntu-24.04-arm]
+        include:
+          - runner: ubuntu-24.04
+            required: true
+          # Hosted arm64 runners have no /dev/kvm (probed 2026-10-14); kept to notice if that changes.
+          - runner: ubuntu-24.04-arm
+            required: false
     runs-on: ${{ matrix.runner }}
+    continue-on-error: ${{ !matrix.required }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Host info
         run: |
