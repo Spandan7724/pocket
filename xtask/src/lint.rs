@@ -71,6 +71,9 @@ pub struct Graph {
     pub deps: BTreeMap<String, BTreeSet<String>>,
     /// (package, dependency path) for every path dependency
     pub path_deps: Vec<(String, String)>,
+    /// guest crate -> every package actually compiled into it (from `cargo tree`; cargo
+    /// metadata also lists weak optional deps that are never built)
+    pub guest_closure: BTreeMap<String, BTreeSet<String>>,
 }
 
 fn load() -> Result<Graph> {
@@ -119,10 +122,34 @@ fn load() -> Result<Graph> {
             }
         }
     }
+    let mut guest_closure = BTreeMap::new();
+    for c in GUEST_CRATES {
+        let tree = output(
+            Command::new(env!("CARGO"))
+                .current_dir(root())
+                .args([
+                    "tree",
+                    "--locked",
+                    "--package",
+                    c,
+                    "--edges",
+                    "normal,build",
+                ])
+                .args(["--prefix", "none", "--format", "{p}", "--target", "all"]),
+        )?;
+        let names = tree
+            .lines()
+            .filter_map(|l| l.split_whitespace().next())
+            .filter(|n| n != c)
+            .map(String::from)
+            .collect();
+        guest_closure.insert(c.to_string(), names);
+    }
     Ok(Graph {
         members,
         deps,
         path_deps,
+        guest_closure,
     })
 }
 
@@ -142,18 +169,9 @@ pub fn check_graph(g: &Graph, root: &Path) -> Vec<String> {
             }
         }
     }
-    for c in GUEST_CRATES {
-        let mut seen = BTreeSet::new();
-        let mut stack = vec![c.to_string()];
-        while let Some(n) = stack.pop() {
-            for d in g.deps.get(&n).into_iter().flatten() {
-                if seen.insert(d.clone()) {
-                    stack.push(d.clone());
-                }
-            }
-        }
-        for d in seen {
-            if !g.members.contains(&d) && !GUEST_EXTERNAL.contains(&d.as_str()) {
+    for (c, closure) in &g.guest_closure {
+        for d in closure {
+            if !g.members.contains(d) && !GUEST_EXTERNAL.contains(&d.as_str()) {
                 errs.push(format!(
                     "{c} pulls in `{d}`: guest crates stay small (GUEST_EXTERNAL)"
                 ));
@@ -222,6 +240,7 @@ mod tests {
             members,
             deps,
             path_deps: vec![],
+            guest_closure: BTreeMap::new(),
         }
     }
 
@@ -243,7 +262,11 @@ mod tests {
 
     #[test]
     fn heavy_guest_dependency_fails() {
-        let g = graph(&[("pocket-init", "pocket-proto"), ("pocket-proto", "tokio")]);
+        let mut g = graph(&[("pocket-init", "pocket-proto")]);
+        g.guest_closure.insert(
+            "pocket-init".into(),
+            ["pocket-proto", "serde", "tokio"].map(String::from).into(),
+        );
         let errs = check_graph(&g, Path::new("/r"));
         assert!(
             errs.iter()

@@ -11,3 +11,7 @@ AGENTS.md
 /spike/out/
 /spike/kernel/build/
 __pycache__/
+/fuzz/target/
+/fuzz/corpus/
+/fuzz/artifacts/
+/fuzz/Cargo.lock

@@ -1,0 +1,29 @@
+[package]
+name = "pocket-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+pocket-proto = { path = "../crates/pocket-proto" }
+
+[[bin]]
+name = "guest_decoders"
+path = "fuzz_targets/guest_decoders.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "frame_reader"
+path = "fuzz_targets/frame_reader.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
