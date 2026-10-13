@@ -1,0 +1,16 @@
+[package]
+name = "pocket-tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+path = "support/mod.rs"
+
+[dependencies]
+pocket-proto = { path = "../crates/pocket-proto" }
+pocket-vmm = { path = "../crates/pocket-vmm" }

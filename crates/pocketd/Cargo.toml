@@ -1,0 +1,19 @@
+[package]
+name = "pocketd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+pocket-vmm = { path = "../pocket-vmm" }
+pocket-image = { path = "../pocket-image" }
+pocket-net = { path = "../pocket-net" }
+pocket-git = { path = "../pocket-git" }
+pocket-store = { path = "../pocket-store" }
+pocket-proto = { path = "../pocket-proto" }
