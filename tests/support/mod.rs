@@ -15,7 +15,8 @@ use std::time::{Duration, Instant};
 use pocket_vmm::cloud_hypervisor::{Disk, LaunchSpec};
 
 pub const BOOT_ARGS: &str = "root=/dev/vda ro rootfstype=erofs init=/pocket-init \
-    reboot=k panic=-1 8250.nr_uarts=1 i8042.noaux i8042.nomux i8042.dumbkbd quiet";
+    reboot=k panic=-1 8250.nr_uarts=1 i8042.noaux i8042.nomux i8042.dumbkbd quiet \
+    rcupdate.rcu_expedited=1";
 
 pub struct Assets {
     pub vmm: PathBuf,
@@ -148,6 +149,9 @@ impl TestVm {
                 read_only: false,
             });
             cmdline.push_str(&format!(" pocket.disk={dev}"));
+        }
+        if o.serial {
+            cmdline.push_str(" loglevel=7");
         }
         if !o.extra_cmdline.is_empty() {
             cmdline.push(' ');

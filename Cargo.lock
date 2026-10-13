@@ -97,6 +97,7 @@ version = "0.0.0"
 name = "pocket-tests"
 version = "0.0.0"
 dependencies = [
+ "libc",
  "pocket-proto",
  "pocket-vmm",
 ]
