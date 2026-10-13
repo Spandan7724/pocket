@@ -11,3 +11,8 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+libc = "0.2"
+thiserror = "2"
+
+[dev-dependencies]
+libc = "0.2"

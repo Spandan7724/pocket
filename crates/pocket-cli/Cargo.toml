@@ -7,13 +7,13 @@ repository.workspace = true
 publish.workspace = true
 rust-version.workspace = true
 
+[[bin]]
+name = "pocket"
+path = "src/main.rs"
+
 [lints]
 workspace = true
 
 [dependencies]
-
-[[bin]]
-name = "pocket"
-path = "src/main.rs"
 pocket-tui = { path = "../pocket-tui" }
 pocket-proto = { path = "../pocket-proto" }

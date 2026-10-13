@@ -1,0 +1,91 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  x86_64:
+    # Pinned: ubuntu-latest moves to 26.04 and KVM access must be re-probed first (D14).
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Host packages
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -q -y --no-install-recommends \
+            erofs-utils e2fsprogs bc bison flex libelf-dev libssl-dev cpio
+
+      - name: Grant /dev/kvm to the runner user
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: KVM and cgroup probe
+        run: |
+          grep -m1 -o -w -E 'vmx|svm' /proc/cpuinfo
+          ls -l /dev/kvm
+          test -r /dev/kvm && test -w /dev/kvm
+          cat "/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/cgroup.controllers"
+          systemd-run --user --scope --quiet true && echo "systemd user scope: ok"
+
+      - name: Rust toolchains
+        run: |
+          rustup show active-toolchain
+          rustup toolchain install nightly --profile minimal
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-directories: |
+            ~/.cargo/bin
+            target/pocket/cache
+            target/pocket/tools
+
+      - name: Kernel and VMM build cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            target/pocket/kernel-build
+            target/pocket/src
+            target/pocket/bin
+          key: assets-${{ runner.os }}-${{ hashFiles('guest/kernel/**', 'xtask/src/kernel.rs', 'xtask/src/assets.rs') }}
+
+      - name: cargo-fuzz
+        run: command -v cargo-fuzz || cargo install cargo-fuzz --locked
+
+      - name: cargo xtask ci
+        env:
+          POCKET_KVM_TESTS: require
+          POCKET_CI_FUZZ: require
+        run: cargo xtask ci
+
+  aarch64:
+    # Hosted arm64 runners have no /dev/kvm (D14): build and unit tests only.
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --workspace --locked
+      - name: Unit tests (VM tests skip without KVM)
+        run: cargo test --workspace --locked
+      - name: Static guest binaries
+        run: |
+          cargo build --locked --profile release-init --target aarch64-unknown-linux-musl -p pocket-init -p pocket-guest
+          file target/aarch64-unknown-linux-musl/release-init/pocket-init | tee /dev/stderr | grep -q 'statically linked'
