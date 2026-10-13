@@ -78,7 +78,12 @@ fn inner() -> Result {
     assets::system()?;
     assets::test_base()?;
     step("integration tests (KVM)");
-    run(cargo().args(["test", "--package", "pocket-tests", "--locked"]))?;
+    run(cargo().env("POCKET_ASSETS_DIR", out()).args([
+        "test",
+        "--package",
+        "pocket-tests",
+        "--locked",
+    ]))?;
     actionlint()?;
     fuzz_smoke(15)?;
     Ok(())

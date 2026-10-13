@@ -17,9 +17,12 @@ pub fn root() -> PathBuf {
         .to_path_buf()
 }
 
-/// Build artifacts and download caches; repo-local so CI isolation never touches it.
+/// Build artifacts and download caches (`POCKET_BUILD_DIR`, default `target/pocket`);
+/// never inside the isolated XDG dirs, so `xtask ci` reuses it across runs.
 pub fn out() -> PathBuf {
-    root().join("target").join("pocket")
+    std::env::var_os("POCKET_BUILD_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| root().join("target").join("pocket"))
 }
 
 pub fn step(name: &str) {

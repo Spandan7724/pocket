@@ -15,6 +15,8 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Kernel/VMM build trees live outside the repo so rust-cache never scans them.
+  POCKET_BUILD_DIR: ${{ github.workspace }}/../pocket-build
 
 jobs:
   x86_64:
@@ -52,18 +54,17 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          cache-directories: |
-            ~/.cargo/bin
-            target/pocket/cache
-            target/pocket/tools
+          cache-directories: ~/.cargo/bin
 
-      - name: Kernel and VMM build cache
-        uses: actions/cache@v4
+      - name: Kernel, VMM and download cache
+        uses: actions/cache@v6
         with:
           path: |
-            target/pocket/kernel-build
-            target/pocket/src
-            target/pocket/bin
+            ${{ env.POCKET_BUILD_DIR }}/kernel-build
+            ${{ env.POCKET_BUILD_DIR }}/src
+            ${{ env.POCKET_BUILD_DIR }}/bin
+            ${{ env.POCKET_BUILD_DIR }}/cache
+            ${{ env.POCKET_BUILD_DIR }}/tools
           key: assets-${{ runner.os }}-${{ hashFiles('guest/kernel/**', 'xtask/src/kernel.rs', 'xtask/src/assets.rs') }}
 
       - name: cargo-fuzz
