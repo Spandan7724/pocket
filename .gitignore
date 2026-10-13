@@ -5,3 +5,9 @@
 /docs/
 CLAUDE.md
 AGENTS.md
+
+# Spike artifacts (binaries, kernels, measurement output)
+/spike/bin/
+/spike/out/
+/spike/kernel/build/
+__pycache__/
