@@ -485,8 +485,8 @@ pub fn build_erofs_from_tar(mkfs: &Path, tar: &Path, out: &Path) -> Result<(), I
     let tmp = out.with_extension("tmp");
     let _ = fs::remove_file(&tmp);
     let o = Command::new(mkfs)
+        .stdout(Stdio::null())
         .arg("--tar=f")
-        .arg("--quiet")
         .arg("-Uc1b9d5a2-0000-4000-8000-706f636b6574")
         .arg(&tmp)
         .arg(tar)

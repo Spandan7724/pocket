@@ -67,6 +67,12 @@ jobs:
             ${{ env.POCKET_BUILD_DIR }}/tools
           key: assets-${{ runner.os }}-${{ hashFiles('guest/kernel/**', 'xtask/src/kernel.rs', 'xtask/src/assets.rs') }}
 
+      - name: Preset image cache
+        uses: actions/cache@v6
+        with:
+          path: ${{ env.POCKET_BUILD_DIR }}/presets
+          key: presets-${{ runner.os }}-${{ hashFiles('guest/presets/**', 'crates/pocketd/src/presets.rs') }}
+
       - name: cargo-fuzz
         run: command -v cargo-fuzz || cargo install cargo-fuzz --locked
 

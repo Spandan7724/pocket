@@ -15,6 +15,7 @@ commands:
   vmm                         build the pinned cloud-hypervisor
   test-base                   build the integration-test base image
   assets                      kernel + vmm + system + test-base
+  presets                     build the preset images into the assets dir (isolated)
   lint-deps                   check crate dependency directions
   fuzz [SECONDS]              run every fuzz target (default 60 s each)
   isolation-selftest          prove ci isolation cleans up after a failing, leaking command";
@@ -36,6 +37,7 @@ fn main() -> ExitCode {
             assets::test_base()?;
             Ok(())
         })(),
+        Some("presets") => ci::presets_isolated(),
         Some("lint-deps") => lint::lint_deps(),
         Some("fuzz") => ci::fuzz_smoke(args.get(1).and_then(|s| s.parse().ok()).unwrap_or(60)),
         Some("isolation-selftest") => ci::selftest(),

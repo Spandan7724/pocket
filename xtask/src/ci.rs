@@ -30,6 +30,18 @@ const XDG: &[(&str, &str)] = &[
     ("HOME", "home"),
 ];
 
+pub fn presets_isolated() -> Result {
+    if env::var_os("POCKET_CI_INNER").is_some() {
+        return presets();
+    }
+    let argv: Vec<OsString> = vec![env!("CARGO").into(), "xtask".into(), "presets".into()];
+    let (st, _) = isolated(&argv, &[("POCKET_CI_INNER", "1".into())])?;
+    if !st.success() {
+        bail!("presets failed ({st})");
+    }
+    Ok(())
+}
+
 pub fn ci() -> Result {
     if env::var_os("POCKET_CI_INNER").is_some() {
         return inner();
@@ -77,16 +89,43 @@ fn inner() -> Result {
     assets::vmm()?;
     assets::system()?;
     assets::test_base()?;
+    presets()?;
     step("integration tests (KVM)");
-    run(cargo().env("POCKET_ASSETS_DIR", out()).args([
-        "test",
-        "--package",
-        "pocket-tests",
-        "--locked",
-    ]))?;
+    run(cargo()
+        .env("POCKET_ASSETS_DIR", out())
+        .env("POCKET_PRESET_CACHE", out().join("presets"))
+        .args(["test", "--package", "pocket-tests", "--locked"]))?;
     actionlint()?;
     fuzz_smoke(15)?;
     Ok(())
+}
+
+pub const PRESETS: &[&str] = &["base", "claude", "codex"];
+
+/// Builds the CLI and daemon, then the preset images into `<out>/presets` (a cache hit
+/// when the preset scripts are unchanged). Expects isolated XDG dirs.
+pub fn presets() -> Result {
+    step("pocket binaries");
+    run(Command::new(env!("CARGO"))
+        .current_dir(root())
+        .args(["build", "--locked", "-p", "pocket-cli", "-p", "pocketd"]))?;
+    step("preset images");
+    if !Path::new("/dev/kvm").exists() {
+        eprintln!("SKIPPED: preset images need /dev/kvm");
+        return Ok(());
+    }
+    let bin = root().join("target/debug");
+    let pocket = |args: &[&str]| {
+        let mut c = Command::new(bin.join("pocket"));
+        c.args(args)
+            .env("POCKET_ASSETS_DIR", out())
+            .env("POCKET_PRESET_CACHE", out().join("presets"))
+            .env("POCKETD", bin.join("pocketd"));
+        c
+    };
+    let res = PRESETS.iter().try_for_each(|p| run(&mut pocket(&["pull", p])));
+    let _ = status(&mut pocket(&["daemon", "stop"]));
+    res
 }
 
 /// Guest binaries must build for aarch64 too; VM tests there need an arm64 KVM host (D14).
