@@ -332,6 +332,14 @@ impl Store {
         Ok(())
     }
 
+    pub fn set_meta(&self, id: &str, meta_json: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE pockets SET meta_json = ?2 WHERE id = ?1",
+            params![id, meta_json],
+        )?;
+        Ok(())
+    }
+
     pub fn touch(&self, id: &str, now: u64) -> Result<()> {
         self.conn.execute(
             "UPDATE pockets SET last_active_at = ?2 WHERE id = ?1",

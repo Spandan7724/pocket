@@ -258,7 +258,11 @@ impl GuestConn {
     }
 
     /// Runs a process to completion, collecting output (stdout capped at `max_out`).
-    pub async fn exec(&self, req: ExecReq<'_>, max_out: usize) -> Result<ExecOutput, GuestConnError> {
+    pub async fn exec(
+        &self,
+        req: ExecReq<'_>,
+        max_out: usize,
+    ) -> Result<ExecOutput, GuestConnError> {
         use pocket_proto::guest::{ExecOut, ExitStatus};
         let mut s = self.exec_stream(req).await?;
         let mut out = ExecOutput {

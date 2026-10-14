@@ -15,5 +15,10 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
-pocket-tui = { path = "../pocket-tui" }
+clap = { version = "4.6", features = ["derive"] }
+libc = "0.2"
+miette = { version = "7.6", features = ["fancy"] }
 pocket-proto = { path = "../pocket-proto", features = ["rpc"] }
+pocket-tui = { path = "../pocket-tui" }
+serde = "1"
+serde_json = "1"

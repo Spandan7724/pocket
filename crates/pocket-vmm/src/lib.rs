@@ -157,6 +157,18 @@ pub struct SnapshotRef {
     pub disks: Vec<DiskSpec>,
 }
 
+/// Default backend's binary inside an assets directory (`<assets>/bin/…`).
+pub fn default_binary(assets: &Path) -> PathBuf {
+    assets.join("bin").join("cloud-hypervisor")
+}
+
+/// The default backend (D3), using the VMM binary at `binary`.
+pub fn default_backend(binary: PathBuf) -> Result<std::sync::Arc<dyn VmmBackend>, VmmError> {
+    Ok(std::sync::Arc::new(cloud_hypervisor::CloudHypervisor::new(
+        binary,
+    )?))
+}
+
 pub trait VmmBackend: Send + Sync {
     fn name(&self) -> &'static str;
     fn version(&self) -> &str;

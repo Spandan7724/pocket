@@ -401,7 +401,7 @@ where
             guest,
             400,
             "Bad Request",
-            "pocket proxy: only CONNECT and absolute http:// requests are proxied\n",
+            "pocket proxy: only CONNECT and absolute http:// requests are proxied (this client sent an https:// URL without CONNECT; use curl or GNU wget)\n",
         )
         .await;
         return None;

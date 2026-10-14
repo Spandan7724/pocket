@@ -114,6 +114,13 @@ fn handle(id: u64, req: HostReq) -> Result<Reply, GuestError> {
             proxy_port,
         } => {
             sys::sethostname(&hostname).map_err(io_err("sethostname"))?;
+            let hosts =
+                format!("127.0.0.1 localhost\n127.0.1.1 {hostname}\n::1 localhost ip6-localhost\n");
+            if let Err(e) = fs::write("/etc/hosts", hosts)
+                .and_then(|()| fs::write("/etc/hostname", format!("{hostname}\n")))
+            {
+                log!("write /etc/hosts: {e}");
+            }
             sys::add_entropy(&rng_seed).map_err(io_err("rng seed"))?;
             if time_unix_nanos > 0 {
                 sys::set_realtime(time_unix_nanos).map_err(io_err("set clock"))?;
