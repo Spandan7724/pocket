@@ -11,3 +11,9 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+pocket-proto = { path = "../pocket-proto", features = ["rpc"] }
+thiserror = "2"
+tokio = { version = "1.53", features = ["net", "io-util", "time", "rt", "macros"] }
+
+[dev-dependencies]
+tokio = { version = "1.53", features = ["net", "io-util", "time", "rt-multi-thread", "macros"] }
