@@ -141,21 +141,20 @@ enum DaemonCmd {
 }
 
 fn parse_size_mib(s: &str) -> Result<u64> {
-    let t = s.trim();
-    let (num, mul) = match t.chars().last().map(|c| c.to_ascii_uppercase()) {
-        Some('G') => (&t[..t.len() - 1], 1024),
-        Some('M') => (&t[..t.len() - 1], 1),
-        Some('T') => (&t[..t.len() - 1], 1024 * 1024),
-        _ => (t, 1),
+    let bad = || CliError::usage(format!("invalid size {s:?}")).hint("use e.g. 4G or 512M");
+    let t = s.trim().to_ascii_uppercase();
+    let t = t.strip_suffix("IB").or_else(|| t.strip_suffix('B')).unwrap_or(&t);
+    let (num, mul) = match t.chars().last() {
+        Some('T') => (&t[..t.len() - 1], 1024.0 * 1024.0),
+        Some('G') => (&t[..t.len() - 1], 1024.0),
+        Some('M') => (&t[..t.len() - 1], 1.0),
+        _ => (t, 1.0),
     };
-    let n: f64 = num
-        .trim_end_matches(['i', 'I', 'b', 'B'])
-        .parse()
-        .map_err(|_| CliError::usage(format!("invalid size {s:?}")).hint("use e.g. 4G or 512M"))?;
+    let n: f64 = num.parse().map_err(|_| bad())?;
     if n.is_nan() || n <= 0.0 {
-        return Err(CliError::usage(format!("invalid size {s:?}")));
+        return Err(bad());
     }
-    Ok((n * mul as f64) as u64)
+    Ok((n * mul) as u64)
 }
 
 /// `POCKET[:SESSION]`.
