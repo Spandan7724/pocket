@@ -17,11 +17,23 @@ pub struct CgroupSpec {
     pub tasks_max: u32,
 }
 
+/// Points systemd user tools at the user manager even when `XDG_RUNTIME_DIR` was
+/// redirected (tests, CI isolation): they connect to `$XDG_RUNTIME_DIR/systemd/private`.
+fn user_bus(c: &mut Command) -> &mut Command {
+    let private = |d: &std::path::Path| d.join("systemd/private").exists();
+    let ours = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from);
+    let real = std::path::PathBuf::from(format!("/run/user/{}", unsafe { libc::getuid() }));
+    if !ours.as_deref().is_some_and(private) && private(&real) {
+        c.env("XDG_RUNTIME_DIR", real);
+    }
+    c
+}
+
 /// Whether `systemd-run --user --scope` works here (cached).
 pub fn systemd_scopes_available() -> bool {
     static OK: OnceLock<bool> = OnceLock::new();
     *OK.get_or_init(|| {
-        Command::new("systemd-run")
+        user_bus(&mut Command::new("systemd-run"))
             .args(["--user", "--scope", "--quiet", "--collect", "true"])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -35,6 +47,7 @@ pub fn systemd_scopes_available() -> bool {
 /// --scope` execs the command, so the spawned pid is the VMM itself.
 pub fn wrap(spec: &CgroupSpec, inner: &Command) -> Command {
     let mut c = Command::new("systemd-run");
+    user_bus(&mut c);
     c.args(["--user", "--scope", "--quiet", "--collect"])
         .arg(format!("--unit={}", spec.unit))
         .arg(format!("--slice={}", spec.slice))
@@ -48,7 +61,7 @@ pub fn wrap(spec: &CgroupSpec, inner: &Command) -> Command {
 }
 
 pub fn stop_scope(unit: &str) {
-    let _ = Command::new("systemctl")
+    let _ = user_bus(&mut Command::new("systemctl"))
         .args(["--user", "stop", &format!("{unit}.scope")])
         .stdin(Stdio::null())
         .stdout(Stdio::null())

@@ -772,6 +772,7 @@ dependencies = [
  "pocket-image",
  "pocket-proto",
  "pocket-vmm",
+ "serde_json",
  "tokio",
 ]
 

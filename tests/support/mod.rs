@@ -4,6 +4,7 @@
 //! they print why and return, unless `POCKET_KVM_TESTS=require`, which turns the skip into
 //! a failure.
 
+pub mod cli;
 pub mod guest;
 
 use std::fs;

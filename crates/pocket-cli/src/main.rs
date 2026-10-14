@@ -143,7 +143,10 @@ enum DaemonCmd {
 fn parse_size_mib(s: &str) -> Result<u64> {
     let bad = || CliError::usage(format!("invalid size {s:?}")).hint("use e.g. 4G or 512M");
     let t = s.trim().to_ascii_uppercase();
-    let t = t.strip_suffix("IB").or_else(|| t.strip_suffix('B')).unwrap_or(&t);
+    let t = t
+        .strip_suffix("IB")
+        .or_else(|| t.strip_suffix('B'))
+        .unwrap_or(&t);
     let (num, mul) = match t.chars().last() {
         Some('T') => (&t[..t.len() - 1], 1024.0 * 1024.0),
         Some('G') => (&t[..t.len() - 1], 1024.0),
@@ -418,6 +421,10 @@ fn run(cli: Cli) -> Result<u8> {
             DaemonCmd::Stop => {
                 if let Some(mut c) = Client::connect_existing() {
                     c.request(Request::DaemonStop)?;
+                    drop(c);
+                    if !Client::wait_daemon_gone(std::time::Duration::from_secs(10)) {
+                        return Err(CliError::daemon("pocketd did not exit within 10 s"));
+                    }
                     println!("pocketd stopped");
                 } else {
                     println!("pocketd is not running");

@@ -83,40 +83,70 @@ impl Client {
             return Client::handshake(s);
         }
         let bin = pocketd_binary();
-        let mut cmd = Command::new(&bin);
-        cmd.stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .process_group(0);
-        let mut child = cmd.spawn().map_err(|e| {
-            CliError::daemon(format!("could not start {}: {e}", bin.display()))
-                .hint("install pocketd next to pocket, or set POCKETD to its path")
-        })?;
         let deadline = Instant::now() + Duration::from_secs(10);
+        let mut child: Option<std::process::Child> = None;
         loop {
             if let Ok(s) = UnixStream::connect(&sock) {
-                // Reaped by init after we exit; it keeps running.
-                std::mem::forget(child);
+                // pocketd outlives us; it is reparented when we exit.
+                if let Some(c) = child {
+                    std::mem::forget(c);
+                }
                 return Client::handshake(s);
             }
-            if let Ok(Some(st)) = child.try_wait() {
+            if child.is_none() {
+                let mut cmd = Command::new(&bin);
+                cmd.stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::piped())
+                    .process_group(0);
+                child = Some(cmd.spawn().map_err(|e| {
+                    CliError::daemon(format!("could not start {}: {e}", bin.display()))
+                        .hint("install pocketd next to pocket, or set POCKETD to its path")
+                })?);
+            }
+            if let Some(c) = child.as_mut()
+                && let Ok(Some(st)) = c.try_wait()
+            {
                 let mut err = String::new();
-                if let Some(mut e) = child.stderr.take() {
+                if let Some(mut e) = c.stderr.take() {
                     let _ = io::Read::read_to_string(&mut e, &mut err);
                 }
-                if st.code() == Some(3)
-                    && let Ok(s) = UnixStream::connect(&sock)
-                {
-                    return Client::handshake(s);
+                child = None;
+                // 3 = another pocketd holds the lock (starting, or still shutting down).
+                if st.code() != Some(3) {
+                    return Err(
+                        CliError::daemon(format!("pocketd exited ({st}): {}", err.trim())).hint(
+                            "run `pocket doctor`; details in $XDG_STATE_HOME/pocket/pocketd.log",
+                        ),
+                    );
                 }
-                return Err(
-                    CliError::daemon(format!("pocketd exited ({st}): {}", err.trim()))
-                        .hint("run `pocket doctor`; details in $XDG_STATE_HOME/pocket/pocketd.log"),
-                );
             }
             if Instant::now() > deadline {
                 return Err(CliError::daemon("pocketd did not start within 10 s")
                     .hint("check $XDG_STATE_HOME/pocket/pocketd.log"));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Waits until no pocketd holds the daemon lock.
+    pub fn wait_daemon_gone(timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let path = runtime_dir().join("pocketd.lock");
+        loop {
+            let free = match std::fs::File::open(&path) {
+                Ok(f) => {
+                    use std::os::fd::AsRawFd;
+                    // SAFETY: flock on an open descriptor; released when `f` drops.
+                    unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
+                }
+                Err(_) => true,
+            };
+            if free {
+                return true;
+            }
+            if Instant::now() > deadline {
+                return false;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
