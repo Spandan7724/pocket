@@ -108,6 +108,8 @@ pub fn listen(
         }
     }));
     if let Some(repo) = rec.info.repo_path.clone() {
+        let repo =
+            pocket_git::git_dir(&repo).map_err(|e| err(ErrorCode::Workspace, e.to_string()))?;
         let l = bind(&host_listener_path(vsock_uds, GIT_PORT))?;
         let name = rec.info.name.clone();
         let _ = d;
@@ -135,9 +137,10 @@ async fn serve_upload_pack(s: UnixStream, repo: &Path) -> std::io::Result<()> {
     let mut child = cmd
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .kill_on_drop(true)
         .spawn()?;
+    let mut stderr = child.stderr.take().unwrap();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = child.stdout.take().unwrap();
     let (mut r, mut w) = s.into_split();
@@ -147,6 +150,11 @@ async fn serve_upload_pack(s: UnixStream, repo: &Path) -> std::io::Result<()> {
     let _ = tokio::io::copy(&mut stdout, &mut w).await;
     let _ = tokio::io::AsyncWriteExt::shutdown(&mut w).await;
     up.abort();
-    let _ = child.wait().await;
+    let st = child.wait().await?;
+    if !st.success() {
+        let mut msg = String::new();
+        let _ = tokio::io::AsyncReadExt::read_to_string(&mut stderr, &mut msg).await;
+        return Err(std::io::Error::other(format!("{st}: {}", msg.trim())));
+    }
     Ok(())
 }

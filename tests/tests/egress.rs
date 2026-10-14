@@ -219,7 +219,26 @@ fn package_managers_work_through_the_dev_profile() {
         "{}",
         String::from_utf8_lossy(&o.stderr)
     );
-    let log = env.ok(&["logs", &n, "--net", "-n", "200"]);
+    // Tunnels are logged when they close, a moment after the client exits.
+    let want = [
+        "registry.npmjs.org",
+        "pypi.org",
+        "files.pythonhosted.org",
+        "index.crates.io",
+        "static.crates.io",
+        "github.com",
+        "example.com",
+    ];
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let log = loop {
+        let log = env.ok(&["logs", &n, "--net", "-n", "200"]);
+        if want.iter().all(|h| log.contains(&format!("{h}:443")))
+            || std::time::Instant::now() > deadline
+        {
+            break log;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    };
     for h in [
         "registry.npmjs.org",
         "pypi.org",

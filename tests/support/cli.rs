@@ -133,6 +133,18 @@ impl Drop for Env {
             }
             let _ = self.cmd("pocket").args(["daemon", "stop"]).output();
         }
+        // A daemon that refused us (e.g. the peer-credential test) is stopped by signal.
+        let needle = format!("XDG_RUNTIME_DIR={}", self.root.join("run").display());
+        for e in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
+            let Ok(pid) = e.file_name().to_string_lossy().parse::<i32>() else {
+                continue;
+            };
+            let exe = std::fs::read_link(format!("/proc/{pid}/exe")).unwrap_or_default();
+            let env = std::fs::read(format!("/proc/{pid}/environ")).unwrap_or_default();
+            if exe.ends_with("pocketd") && env.split(|b| *b == 0).any(|v| v == needle.as_bytes()) {
+                unsafe { libc::kill(pid, libc::SIGTERM) };
+            }
+        }
         if std::thread::panicking() {
             eprintln!("--- pocketd.log\n{}", self.log());
         }

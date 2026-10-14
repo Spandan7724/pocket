@@ -20,8 +20,8 @@ use crate::term::{self, AltTracker, GUEST_ALT, RawGuard};
 use crate::vsock;
 
 pub const PREFIX: u8 = 0x1d; // Ctrl-]
-/// Terminal replies to queries replayed from scrollback arrive as input; drop escape
-/// sequences typed in this window after attaching.
+/// Terminal replies to queries replayed from scrollback arrive as input; such reply
+/// sequences are dropped in this window after attaching.
 const REPLAY_QUIET: Duration = Duration::from_millis(300);
 
 static WINCH_FD: AtomicI32 = AtomicI32::new(-1);
@@ -169,6 +169,55 @@ impl Drop for Session {
     }
 }
 
+/// Removes terminal reply sequences (cursor position and device attribute reports,
+/// OSC colour replies, DCS strings) from `input`; everything else passes unchanged.
+fn strip_terminal_replies(input: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(input.len());
+    let mut i = 0;
+    while i < input.len() {
+        if input[i] == 0x1b && i + 1 < input.len() {
+            let start = i;
+            match input[i + 1] {
+                b'[' => {
+                    let mut j = i + 2;
+                    while j < input.len()
+                        && matches!(input[j], b'0'..=b'9' | b';' | b'?' | b'>' | b'=')
+                    {
+                        j += 1;
+                    }
+                    if j < input.len()
+                        && matches!(input[j], b'R' | b'c' | b'n' | b't' | b'y')
+                        && j > i + 2
+                    {
+                        i = j + 1;
+                        continue;
+                    }
+                }
+                b']' | b'P' => {
+                    let mut j = i + 2;
+                    while j < input.len()
+                        && input[j] != 0x07
+                        && !(input[j] == 0x1b && input.get(j + 1) == Some(&b'\\'))
+                    {
+                        j += 1;
+                    }
+                    if j < input.len() {
+                        i = if input[j] == 0x07 { j + 1 } else { j + 2 };
+                        continue;
+                    }
+                }
+                _ => {}
+            }
+            out.push(input[start]);
+            i = start + 1;
+            continue;
+        }
+        out.push(input[i]);
+        i += 1;
+    }
+    out
+}
+
 fn read_key() -> Option<u8> {
     let mut b = [0u8; 1];
     // SAFETY: blocking read of one byte from stdin.
@@ -287,9 +336,13 @@ fn run(s: &mut Session, client: &mut Client, pocket: &str, session: &str) -> End
             return End::Detached;
         }
         let input = &buf[..n as usize];
-        if started.elapsed() < REPLAY_QUIET && input.first() == Some(&0x1b) {
-            continue;
-        }
+        let filtered;
+        let input = if started.elapsed() < REPLAY_QUIET {
+            filtered = strip_terminal_replies(input);
+            &filtered[..]
+        } else {
+            input
+        };
         let mut pending: Vec<u8> = Vec::with_capacity(input.len());
         for &b in input {
             if prefix {
@@ -452,4 +505,21 @@ fn leave_guest_screen() {
     }
     out(term::RESET_MODES);
     out(b"\r\n");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_terminal_replies as s;
+
+    #[test]
+    fn only_terminal_replies_are_stripped() {
+        assert_eq!(
+            s(b"\x1b[12;40R\x1b[?62;22c\x1b]11;rgb:0000/0000/0000\x07ls\r"),
+            b"ls\r"
+        );
+        assert_eq!(s(b"\x1b]10;rgb:ffff/ffff/ffff\x1b\\x"), b"x");
+        assert_eq!(s(b"\x1b:q!\r\x1dd"), b"\x1b:q!\r\x1dd");
+        assert_eq!(s(b"\x1b[A\x1b[1;5C"), b"\x1b[A\x1b[1;5C");
+        assert_eq!(s(b"\x1b"), b"\x1b");
+    }
 }

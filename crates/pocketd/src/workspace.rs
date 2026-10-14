@@ -11,20 +11,28 @@ use crate::guest::ExecReq;
 /// Largest untracked file carried over.
 const MAX_CARRY_FILE: u64 = 16 << 20;
 
+/// Clone-in steps must never hang pocket creation (the per-pocket lock is held).
+const STEP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
 async fn run(live: &Live, argv: &[&str], stdin: Option<Vec<u8>>, what: &str) -> R<String> {
-    let out = live
-        .guest
-        .exec(
-            ExecReq {
-                argv,
-                env: vec![("GIT_TERMINAL_PROMPT".into(), "0".into())],
-                cwd: "/",
-                user: live.user.as_deref(),
-                stdin,
-            },
-            1 << 20,
-        )
+    let exec = live.guest.exec(
+        ExecReq {
+            argv,
+            env: vec![("GIT_TERMINAL_PROMPT".into(), "0".into())],
+            cwd: "/",
+            user: live.user.as_deref(),
+            stdin,
+        },
+        1 << 20,
+    );
+    let out = tokio::time::timeout(STEP_TIMEOUT, exec)
         .await
+        .map_err(|_| {
+            err(
+                ErrorCode::Workspace,
+                format!("{what} timed out after {STEP_TIMEOUT:?}"),
+            )
+        })?
         .map_err(|e| err(ErrorCode::Workspace, format!("{what}: {e}")))?;
     if !out.ok() {
         let mut e = err(

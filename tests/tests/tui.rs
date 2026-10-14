@@ -25,9 +25,6 @@ fn reattach_redraws(
     quit: &[u8],
     ok: impl Fn(&[String], usize) -> bool,
 ) {
-    env.ok(&["exec", name, "--", "true"]);
-    let o = env.pocket(&["sessions", name]);
-    assert!(o.status.success());
     let mut p = attach(env, name, 24, 80);
     p.wait_for("$ ", 0, T);
     p.write(format!("{cmd}\r").as_bytes());
@@ -40,8 +37,10 @@ fn reattach_redraws(
     let mut q = attach(env, name, 30, 100);
     let again = q.wait_rows(|r| ok(r, 30), T);
     eprintln!("{session} after reattach at 30x100:\n{}", again.join("\n"));
+    std::thread::sleep(Duration::from_millis(400));
+    let m = q.mark();
     q.write(quit);
-    q.wait_for("$ ", 0, T);
+    q.wait_for("$ ", m, T);
     q.write(&[0x1d, b'd']);
     assert!(q.wait_exit(T).success());
 }

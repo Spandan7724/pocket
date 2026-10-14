@@ -83,8 +83,13 @@ pub fn repo_info(path: &Path) -> Result<RepoInfo, GitError> {
     })
 }
 
-/// `git upload-pack` serving `repo` read-only, speaking on stdin/stdout.
-pub fn upload_pack(repo: &Path) -> Command {
+/// Absolute git directory of the work tree at `repo` (`upload-pack --strict` needs it).
+pub fn git_dir(repo: &Path) -> Result<PathBuf, GitError> {
+    text(repo, &["rev-parse", "--absolute-git-dir"]).map(PathBuf::from)
+}
+
+/// `git upload-pack` serving the git directory `git_dir` read-only on stdin/stdout.
+pub fn upload_pack(git_dir: &Path) -> Command {
     let mut c = Command::new("git");
     c.args(HARDEN)
         .args([
@@ -96,7 +101,7 @@ pub fn upload_pack(repo: &Path) -> Command {
         .arg("upload-pack")
         .arg("--strict")
         .arg("--timeout=600")
-        .arg(repo)
+        .arg(git_dir)
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env_remove("GIT_DIR")
         .env_remove("GIT_PROTOCOL");

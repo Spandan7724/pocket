@@ -100,7 +100,8 @@ fn remote_helper() -> io::Result<ExitCode> {
 
 fn pipe(host: File) -> io::Result<()> {
     let mut up = host.try_clone()?;
-    let writer = std::thread::spawn(move || -> io::Result<()> {
+    // Not joined: once the host side closes, returning from main ends the stdin reader.
+    std::thread::spawn(move || -> io::Result<()> {
         let mut stdin = stdin_raw();
         let mut buf = vec![0u8; 64 * 1024];
         loop {
@@ -126,7 +127,6 @@ fn pipe(host: File) -> io::Result<()> {
         stdout.flush()?;
     }
     drop(stdout);
-    let _ = writer.join();
     Ok(())
 }
 
