@@ -58,3 +58,21 @@ fn existing_destination_is_never_overwritten() {
     assert_eq!(std::fs::read(&dst).unwrap(), b"keep");
     std::fs::remove_dir_all(d).unwrap();
 }
+
+#[test]
+fn copies_across_filesystems() {
+    let tmp = Path::new("/tmp");
+    let other = Path::new(env!("CARGO_TARGET_TMPDIR"));
+    if fs_magic(tmp) == fs_magic(other) {
+        eprintln!("skipping: /tmp and the target dir are on the same filesystem type");
+        return;
+    }
+    let a = fresh(tmp, "xfs-src");
+    let b = fresh(other, "xfs-dst");
+    let src = sparse_source(&a);
+    let dst = b.join("dst.raw");
+    assert_eq!(clone_disk(&src, &dst).unwrap(), CloneMode::SparseCopy);
+    assert_same_and_sparse(&src, &dst);
+    std::fs::remove_dir_all(a).unwrap();
+    std::fs::remove_dir_all(b).unwrap();
+}

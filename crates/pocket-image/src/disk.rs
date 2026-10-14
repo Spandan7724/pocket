@@ -62,6 +62,22 @@ pub fn clone_disk(src: &Path, dst: &Path) -> Result<CloneMode, DiskError> {
     Ok(CloneMode::SparseCopy)
 }
 
+fn copy_range_rw(s: &File, d: &File, from: i64, to: i64) -> io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    let mut buf = vec![0u8; 1 << 20];
+    let mut off = from as u64;
+    while off < to as u64 {
+        let want = ((to as u64 - off) as usize).min(buf.len());
+        let n = s.read_at(&mut buf[..want], off)?;
+        if n == 0 {
+            break;
+        }
+        d.write_all_at(&buf[..n], off)?;
+        off += n as u64;
+    }
+    Ok(())
+}
+
 fn sparse_copy(s: &File, d: &File, src: &Path, dst: &Path) -> Result<(), DiskError> {
     let len = s.metadata().map_err(err("stat", src))?.len();
     d.set_len(len).map_err(err("truncate", dst))?;
@@ -96,7 +112,16 @@ fn sparse_copy(s: &File, d: &File, src: &Path, dst: &Path) -> Result<(), DiskErr
                 )
             };
             if n < 0 {
-                return Err(err("copy", dst)(io::Error::last_os_error()));
+                let e = io::Error::last_os_error();
+                // Across filesystems copy_file_range gives EXDEV (and some fs refuse it).
+                if matches!(
+                    e.raw_os_error(),
+                    Some(libc::EXDEV | libc::EINVAL | libc::EOPNOTSUPP | libc::ENOSYS)
+                ) {
+                    copy_range_rw(s, d, off_in, hole).map_err(err("copy", dst))?;
+                    break;
+                }
+                return Err(err("copy", dst)(e));
             }
             if n == 0 {
                 break;

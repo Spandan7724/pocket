@@ -194,7 +194,11 @@ pub async fn pull(
         if let Some(dir) = c.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        let _ = pocket_image::disk::clone_disk(&out, &c);
+        if !c.exists()
+            && let Err(e) = pocket_image::disk::clone_disk(&out, &c)
+        {
+            tracing::warn!("copy {name} to the preset cache {}: {e}", c.display());
+        }
     }
     progress(&format!(
         "{name}: built ({:.0} MiB)",
