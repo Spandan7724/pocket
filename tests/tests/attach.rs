@@ -128,6 +128,22 @@ fn new_attach_type_detach_reattach_rm() {
     q.wait_screen(|s| !s.contains("press any key"), T);
     assert_eq!(q.contents(), before, "overlay corrupted the session screen");
 
+    // Ctrl-] n opens a second shell session; Ctrl-] s switches back to the first.
+    q.write(&[0x1d, b'n']);
+    std::thread::sleep(Duration::from_millis(500));
+    let m = q.mark();
+    q.write(b"echo in-$((1+1))nd\r");
+    q.wait_for("in-2nd", m, T);
+    let list = env.ok(&["sessions", &name]);
+    assert!(list.contains("shell-2"), "{list}");
+    q.write(&[0x1d, b's']);
+    q.wait_screen(|s| s.contains("1  shell") && s.contains("2  shell-2") && s.contains("attached"), T);
+    q.write(b"1");
+    std::thread::sleep(Duration::from_millis(500));
+    let m = q.mark();
+    q.write(b"echo back-in-$MARK\r");
+    q.wait_for("back-in-still-here", m, T);
+
     q.write(&[0x1d, b'd']);
     assert!(q.wait_exit(T).success());
     assert!(is_cooked(&q.termios()));
