@@ -10,8 +10,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use pocket_proto::frame::{recv, send};
 use pocket_proto::guest::{
-    AttachIn, AttachOut, ErrorKind, ExitStatus, GuestError, GuestEvent, PtySize, SessionInfo,
-    StreamAck,
+    ATTACH_TOKEN_TTL_MS, AttachIn, AttachOut, ErrorKind, ExitStatus, GuestError, GuestEvent,
+    PtySize, SessionInfo, StreamAck,
 };
 
 use crate::process::{Stdio3, spawn};
@@ -77,6 +77,7 @@ pub fn create(
     env: &[(String, String)],
     cwd: &str,
     size: PtySize,
+    user: Option<&str>,
 ) -> Result<u32, GuestError> {
     let mut map = sessions();
     let map = map.get_or_insert_with(HashMap::new);
@@ -88,7 +89,7 @@ pub fn create(
     }
     let io = |e: std::io::Error| GuestError::new(ErrorKind::Io, format!("pty: {e}"));
     let (master, slave) = sys::openpty(size).map_err(io)?;
-    let (child, status) = spawn(argv, env, cwd, Stdio3::Pty(slave))?;
+    let (child, status) = spawn(argv, env, cwd, Stdio3::Pty(slave), user)?;
     let s = Arc::new(Session {
         name: name.into(),
         pid: child.id(),
@@ -180,8 +181,55 @@ pub fn kill(name: &str, signal: i32) -> Result<(), GuestError> {
         .map_err(|e| GuestError::new(ErrorKind::Io, format!("kill: {e}")))
 }
 
+struct Token {
+    token: Vec<u8>,
+    session: String,
+    expires_ns: u64,
+}
+
+static TOKENS: Mutex<Vec<Token>> = Mutex::new(Vec::new());
+
+pub fn authorize(session: &str, token: Vec<u8>) {
+    let now = sys::boottime_ns();
+    let mut t = TOKENS.lock().unwrap_or_else(|e| e.into_inner());
+    t.retain(|t| t.expires_ns > now);
+    if t.len() >= 1024 {
+        t.remove(0);
+    }
+    t.push(Token {
+        token,
+        session: session.into(),
+        expires_ns: now + ATTACH_TOKEN_TTL_MS * 1_000_000,
+    });
+}
+
+/// Single use: a matching token is removed whether or not the attach then succeeds.
+fn consume(session: &str, token: &[u8]) -> bool {
+    let now = sys::boottime_ns();
+    let mut t = TOKENS.lock().unwrap_or_else(|e| e.into_inner());
+    t.retain(|t| t.expires_ns > now);
+    match t
+        .iter()
+        .position(|t| t.session == session && sys::ct_eq(&t.token, token))
+    {
+        Some(i) => {
+            t.remove(i);
+            true
+        }
+        None => false,
+    }
+}
+
 /// Serves an `Attach` stream. The `StreamAck` has not been sent yet.
-pub fn attach(name: &str, size: PtySize, replay: bool, conn: File) {
+pub fn attach(name: &str, size: PtySize, replay: bool, token: &[u8], conn: File) {
+    if !consume(name, token) {
+        let e = GuestError::new(
+            ErrorKind::InvalidRequest,
+            "attach token missing, used or expired; ask pocketd to authorize the attach",
+        );
+        let _ = send(&mut &conn, &StreamAck(Err(e)));
+        return;
+    }
     let s = match get(name) {
         Ok(s) => s,
         Err(e) => {

@@ -58,6 +58,26 @@ pub fn init_binary() -> Result<PathBuf> {
     Ok(bin)
 }
 
+pub fn guest_binary() -> Result<PathBuf> {
+    run(Command::new(env!("CARGO"))
+        .current_dir(root())
+        .args([
+            "build",
+            "--package",
+            "pocket-guest",
+            "--profile",
+            "release-init",
+        ])
+        .args(["--target", INIT_TARGET]))?;
+    let bin = root()
+        .join("target")
+        .join(INIT_TARGET)
+        .join("release-init")
+        .join("pocket-guest");
+    check_static(&bin)?;
+    Ok(bin)
+}
+
 /// Fails if the ELF requests a dynamic loader (PT_INTERP).
 pub fn check_static(bin: &Path) -> Result {
     let data = fs::read(bin)?;
@@ -109,6 +129,11 @@ pub fn system() -> Result<PathBuf> {
     let dest_init = staging.join("pocket-init");
     fs::copy(&init, &dest_init)?;
     fs::set_permissions(&dest_init, fs::Permissions::from_mode(0o755))?;
+    fs::create_dir(staging.join("bin"))?;
+    let dest_guest = staging.join("bin/pocket-guest");
+    fs::copy(guest_binary()?, &dest_guest)?;
+    fs::set_permissions(&dest_guest, fs::Permissions::from_mode(0o755))?;
+    std::os::unix::fs::symlink("pocket-guest", staging.join("bin/git-remote-pocket"))?;
     let img = system_image();
     mkfs_erofs(&img, &staging)?;
     let listing = output(
@@ -117,7 +142,7 @@ pub fn system() -> Result<PathBuf> {
             .arg(&img),
     )?;
     eprintln!("{} contents:\n{listing}", img.display());
-    if !listing.contains("pocket-init") {
+    if !listing.contains("pocket-init") || !listing.contains("bin") {
         bail!("system image does not contain pocket-init");
     }
     Ok(img)

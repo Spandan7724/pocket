@@ -4,11 +4,13 @@
 mod boot;
 mod control;
 mod exec;
+mod netshim;
 mod process;
 mod reaper;
 mod session;
 mod shutdown;
 mod sys;
+mod users;
 
 use std::sync::Arc;
 

@@ -176,6 +176,7 @@ impl Exec {
             env,
             cwd: cwd.into(),
             pty,
+            user: None,
         });
         let Reply::ExecStarted { pid } = ctl.wait_reply(id)? else {
             panic!("expected ExecStarted")
@@ -186,6 +187,14 @@ impl Exec {
             pid,
             started,
         })
+    }
+
+    pub fn from_stream(stream: UnixStream) -> Exec {
+        Exec {
+            stream,
+            pid: 0,
+            started: Instant::now(),
+        }
     }
 
     pub fn send(&mut self, m: ExecIn) {
@@ -238,6 +247,12 @@ pub fn sh(ctl: &mut Control, vsock_uds: &Path, script: &str) -> String {
     r.out()
 }
 
+pub fn new_token() -> Vec<u8> {
+    let mut t = vec![0u8; ATTACH_TOKEN_LEN];
+    std::io::Read::read_exact(&mut std::fs::File::open("/dev/urandom").unwrap(), &mut t).unwrap();
+    t
+}
+
 pub struct Attach {
     pub stream: UnixStream,
     pub seen: Vec<u8>,
@@ -245,11 +260,28 @@ pub struct Attach {
 }
 
 impl Attach {
+    /// Authorizes a one-time token over `ctl`, then attaches with it.
     pub fn open(
+        ctl: &mut Control,
         vsock_uds: &Path,
         session: &str,
         size: PtySize,
         replay: bool,
+    ) -> Result<Attach, GuestError> {
+        let token = new_token();
+        ctl.request(HostReq::AuthorizeAttach {
+            session: session.into(),
+            token: token.clone(),
+        })?;
+        Attach::open_with_token(vsock_uds, session, size, replay, token)
+    }
+
+    pub fn open_with_token(
+        vsock_uds: &Path,
+        session: &str,
+        size: PtySize,
+        replay: bool,
+        token: Vec<u8>,
     ) -> Result<Attach, GuestError> {
         let stream = open_stream(
             vsock_uds,
@@ -257,6 +289,7 @@ impl Attach {
                 session: session.into(),
                 size,
                 replay_scrollback: replay,
+                token,
             },
         )?;
         Ok(Attach {

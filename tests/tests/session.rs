@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use pocket_proto::guest::{ErrorKind, ExitStatus, GuestEvent, HostReq, PtySize, Reply};
-use pocket_tests::guest::{Attach, Control, argv};
+use pocket_tests::guest::{Attach, Control, argv, new_token};
 use pocket_tests::{TestVm, VmOpts, kvm_or_skip};
 
 const T: Duration = Duration::from_secs(10);
@@ -21,6 +21,7 @@ fn create(
         env: vec![("PS1".into(), "$ ".into())],
         cwd: "/work".into(),
         size: SIZE,
+        user: None,
     })
 }
 
@@ -44,7 +45,22 @@ fn sessions_survive_disconnect_and_replay_scrollback() {
     let err = create(&mut ctl, "shell", &["/bin/sh"]).unwrap_err();
     assert_eq!(err.kind, ErrorKind::AlreadyExists);
 
-    let mut at = Attach::open(u, "shell", SIZE, true).unwrap();
+    // Every attach needs a fresh daemon-issued token; tokens are single use.
+    let err = Attach::open_with_token(u, "shell", SIZE, true, new_token())
+        .err()
+        .unwrap();
+    assert_eq!(err.kind, ErrorKind::InvalidRequest);
+    let token = new_token();
+    ctl.request(HostReq::AuthorizeAttach {
+        session: "shell".into(),
+        token: token.clone(),
+    })
+    .unwrap();
+    let mut at = Attach::open_with_token(u, "shell", SIZE, true, token.clone()).unwrap();
+    let reuse = Attach::open_with_token(u, "shell", SIZE, true, token)
+        .err()
+        .unwrap();
+    assert_eq!(reuse.kind, ErrorKind::InvalidRequest);
     at.type_str("echo marker-$((40+2)); stty size\n");
     at.wait_for("marker-42", 0, T);
     at.wait_for("30 100", 0, T);
@@ -71,6 +87,7 @@ fn sessions_survive_disconnect_and_replay_scrollback() {
     assert_eq!((s.len(), s[0].attached, s[0].exited), (1, 0, None), "{s:?}");
 
     let mut at = Attach::open(
+        &mut ctl,
         u,
         "shell",
         PtySize {
@@ -91,6 +108,7 @@ fn sessions_survive_disconnect_and_replay_scrollback() {
 
     // A second client sees the same live output; attaching without replay skips history.
     let mut other = Attach::open(
+        &mut ctl,
         u,
         "shell",
         PtySize {
@@ -119,7 +137,7 @@ fn sessions_survive_disconnect_and_replay_scrollback() {
     assert_eq!((s[0].exited, s[0].attached), (Some(ExitStatus::Code(5)), 0));
 
     // Attaching to an exited session replays and reports the status.
-    let mut late = Attach::open(u, "shell", SIZE, true).unwrap();
+    let mut late = Attach::open(&mut ctl, u, "shell", SIZE, true).unwrap();
     late.wait_for("shared-output", 0, T);
 
     assert_eq!(
@@ -130,7 +148,9 @@ fn sessions_survive_disconnect_and_replay_scrollback() {
         Ok(Reply::Done)
     );
     assert!(list(&mut ctl).is_empty());
-    let err = Attach::open(u, "shell", SIZE, false).err().unwrap();
+    let err = Attach::open(&mut ctl, u, "shell", SIZE, false)
+        .err()
+        .unwrap();
     assert_eq!(err.kind, ErrorKind::NotFound);
 }
 

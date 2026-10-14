@@ -9,9 +9,10 @@ use std::sync::mpsc::Receiver;
 
 use pocket_proto::guest::{ErrorKind, ExitStatus, GuestError};
 
-use crate::{reaper, sys};
+use crate::{reaper, sys, users};
 
-const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+const DEFAULT_PATH: &str =
+    "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/run/pocket/system/bin";
 
 /// Variables from `Configure`, applied to every later process.
 pub static GLOBAL_ENV: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
@@ -27,13 +28,28 @@ pub fn spawn(
     env: &[(String, String)],
     cwd: &str,
     stdio: Stdio3,
+    user: Option<&str>,
 ) -> Result<(Child, Receiver<ExitStatus>), GuestError> {
+    let user = match user {
+        Some(name) => Some(users::lookup(name).ok_or_else(|| {
+            GuestError::new(
+                ErrorKind::NotFound,
+                format!("no user {name} in /etc/passwd"),
+            )
+        })?),
+        None => None,
+    };
     let mut cmd = Command::new(&argv[0]);
     cmd.args(&argv[1..]).current_dir(cwd).env_clear();
-    cmd.env("PATH", DEFAULT_PATH)
-        .env("HOME", "/root")
-        .env("USER", "root")
-        .env("LANG", "C.UTF-8");
+    cmd.env("PATH", DEFAULT_PATH).env("LANG", "C.UTF-8");
+    match &user {
+        Some(u) => cmd
+            .env("HOME", &u.home)
+            .env("USER", &u.name)
+            .env("LOGNAME", &u.name)
+            .env("SHELL", &u.shell),
+        None => cmd.env("HOME", "/root").env("USER", "root"),
+    };
     let is_pty = matches!(stdio, Stdio3::Pty(_));
     if is_pty {
         cmd.env("TERM", "xterm-256color");
@@ -51,6 +67,9 @@ pub fn spawn(
                 .stderr(Stdio::piped());
         }
         Stdio3::Pty(slave) => {
+            if let Some(u) = &user {
+                let _ = sys::fchown(&slave, u.uid, u.gid);
+            }
             let clone = |f: &File| f.try_clone().map(Stdio::from);
             let io = |e: std::io::Error| GuestError::new(ErrorKind::Io, format!("pty: {e}"));
             cmd.stdin(clone(&slave).map_err(io)?)
@@ -58,7 +77,9 @@ pub fn spawn(
                 .stderr(Stdio::from(slave));
         }
     }
-    // SAFETY: only async-signal-safe calls (sigprocmask, setsid, ioctl) run after fork.
+    let ids = user.map(|u| (u.uid, u.gid, u.groups));
+    // SAFETY: only async-signal-safe calls (sigprocmask, setsid, ioctl, set*id) run after
+    // fork; `ids` was allocated before.
     unsafe {
         cmd.pre_exec(move || {
             sys::unblock_all_signals()?;
@@ -69,6 +90,11 @@ pub fn spawn(
                     libc::TIOCSCTTY,
                     0,
                 ))?;
+            }
+            if let Some((uid, gid, groups)) = &ids {
+                sys::cvt(libc::setgroups(groups.len(), groups.as_ptr()))?;
+                sys::cvt(libc::setgid(*gid))?;
+                sys::cvt(libc::setuid(*uid))?;
             }
             Ok(())
         });

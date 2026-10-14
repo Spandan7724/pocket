@@ -33,6 +33,7 @@ pub fn start(
     env: &[(String, String)],
     cwd: &str,
     pty: Option<PtySize>,
+    user: Option<&str>,
 ) -> Result<u32, GuestError> {
     let io = |e: std::io::Error| GuestError::new(ErrorKind::Io, e.to_string());
     let mut execs = EXECS.lock().unwrap_or_else(|e| e.into_inner());
@@ -46,7 +47,7 @@ pub fn start(
     let entry = match pty {
         Some(size) => {
             let (master, slave) = sys::openpty(size).map_err(io)?;
-            let (child, status) = spawn(argv, env, cwd, Stdio3::Pty(slave))?;
+            let (child, status) = spawn(argv, env, cwd, Stdio3::Pty(slave), user)?;
             Entry {
                 pid: child.id() as i32,
                 stdin: None,
@@ -56,7 +57,7 @@ pub fn start(
             }
         }
         None => {
-            let (mut child, status) = spawn(argv, env, cwd, Stdio3::Pipes)?;
+            let (mut child, status) = spawn(argv, env, cwd, Stdio3::Pipes, user)?;
             let out = File::from(std::os::fd::OwnedFd::from(child.stdout.take().unwrap()));
             let err = File::from(std::os::fd::OwnedFd::from(child.stderr.take().unwrap()));
             let stdin = File::from(std::os::fd::OwnedFd::from(child.stdin.take().unwrap()));

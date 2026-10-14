@@ -194,6 +194,11 @@ pub fn boot(p: &mut Phases) -> io::Result<Cmdline> {
 
     p.mark("overlay+pivot");
     sys::sethostname(&c.hostname)?;
+    if let Err(e) = sys::loopback_up() {
+        log!("lo up: {e}");
+    }
+    crate::users::first_boot_setup();
+    p.mark("lo+users");
     seed_from_hwrng();
     p.mark("rng");
     Ok(c)

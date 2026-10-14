@@ -5,6 +5,9 @@
 //! receives replies and events. Each data stream is a separate connection to
 //! [`STREAM_PORT`]: the host sends a [`StreamOpen`], the guest answers a [`StreamAck`],
 //! then frames flow as [`AttachIn`]/[`AttachOut`] or [`ExecIn`]/[`ExecOut`].
+//!
+//! Guest-initiated streams go to the host (CID 2): [`PROXY_PORT`] starts with a
+//! [`ProxyOpen`], [`GIT_PORT`] with a [`GitOpen`]; raw bytes follow.
 
 use serde::{Deserialize, Serialize};
 
@@ -12,7 +15,7 @@ use crate::frame::Validate;
 use crate::{ProtoError, invalid};
 
 /// Bump on every change to the types in this module.
-pub const PROTO_VERSION: u32 = 1;
+pub const PROTO_VERSION: u32 = 2;
 
 pub const CONTROL_PORT: u32 = 1024;
 pub const STREAM_PORT: u32 = 1025;
@@ -20,6 +23,9 @@ pub const PROXY_PORT: u32 = 1026;
 pub const GIT_PORT: u32 = 1027;
 
 pub const RNG_SEED_LEN: usize = 64;
+pub const ATTACH_TOKEN_LEN: usize = 32;
+/// Guest-side lifetime of an unused attach token.
+pub const ATTACH_TOKEN_TTL_MS: u64 = 30_000;
 pub const MAX_NAME: usize = 64;
 pub const MAX_ARGS: usize = 4096;
 pub const MAX_ENV: usize = 1024;
@@ -74,12 +80,14 @@ pub enum HostReq {
         env: Vec<(String, String)>,
         proxy_port: u16,
     },
-    /// The request id doubles as the exec id for [`StreamOpen::ExecIo`].
+    /// The request id doubles as the exec id for [`StreamOpen::ExecIo`]. `user` is a
+    /// guest account name (`None` = root).
     Exec {
         argv: Vec<String>,
         env: Vec<(String, String)>,
         cwd: String,
         pty: Option<PtySize>,
+        user: Option<String>,
     },
     SessionCreate {
         name: String,
@@ -87,6 +95,14 @@ pub enum HostReq {
         env: Vec<(String, String)>,
         cwd: String,
         size: PtySize,
+        user: Option<String>,
+    },
+    /// One-time token for one [`StreamOpen::Attach`] to `session`, valid for
+    /// [`ATTACH_TOKEN_TTL_MS`]. Every attach needs one, so only clients the daemon
+    /// authorized can attach (the direct attach fast path skips the daemon otherwise).
+    AuthorizeAttach {
+        session: String,
+        token: Vec<u8>,
     },
     SessionList,
     /// Signal 0 removes an exited session from the list.
@@ -245,6 +261,7 @@ pub enum StreamOpen {
         session: String,
         size: PtySize,
         replay_scrollback: bool,
+        token: Vec<u8>,
     },
     ExecIo {
         exec_id: u64,
@@ -259,6 +276,32 @@ pub enum StreamOpen {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StreamAck(pub Result<(), GuestError>);
+
+/// First frame of a guest → host [`PROXY_PORT`] stream.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProxyOpen {
+    /// Env-proxy mode: an HTTP proxy conversation (CONNECT or absolute-form) follows; the
+    /// host parses it and applies the policy.
+    HttpProxy,
+    /// Transparent mode (M11): a TCP stream to this destination follows.
+    Direct {
+        host: String,
+        port: u16,
+        sni: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GitService {
+    UploadPack,
+}
+
+/// First frame of a guest → host [`GIT_PORT`] stream. The host serves only the pocket's
+/// own repository, read-only; the guest cannot name a path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitOpen {
+    pub service: GitService,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AttachIn {
@@ -365,6 +408,15 @@ fn seed(s: &[u8]) -> Result<(), ProtoError> {
     check(s.len() == RNG_SEED_LEN, "rng seed must be 64 bytes")
 }
 
+fn user(u: &Option<String>) -> Result<(), ProtoError> {
+    u.as_deref()
+        .map_or(Ok(()), |u| check(valid_name(u), "invalid user name"))
+}
+
+fn token(t: &[u8]) -> Result<(), ProtoError> {
+    check(t.len() == ATTACH_TOKEN_LEN, "attach token must be 32 bytes")
+}
+
 fn error(e: &GuestError) -> Result<(), ProtoError> {
     text(&e.message, MAX_ERROR_MESSAGE, "error message too long")
 }
@@ -391,10 +443,12 @@ impl Validate for HostMsg {
                 env: e,
                 cwd,
                 pty,
+                user: u,
             } => {
                 argv(a)?;
                 env(e)?;
                 abs_path(cwd)?;
+                user(u)?;
                 pty.as_ref().map_or(Ok(()), size)
             }
             HostReq::SessionCreate {
@@ -403,12 +457,18 @@ impl Validate for HostMsg {
                 env: e,
                 cwd,
                 size: s,
+                user: u,
             } => {
                 check(valid_name(name), "invalid session name")?;
                 argv(a)?;
                 env(e)?;
                 abs_path(cwd)?;
+                user(u)?;
                 size(s)
+            }
+            HostReq::AuthorizeAttach { session, token: t } => {
+                check(valid_name(session), "invalid session name")?;
+                token(t)
             }
             HostReq::SessionList => Ok(()),
             HostReq::SessionKill { name, signal: sig } => {
@@ -507,15 +567,43 @@ impl Validate for StreamOpen {
     fn validate(&self) -> Result<(), ProtoError> {
         match self {
             StreamOpen::Attach {
-                session, size: s, ..
+                session,
+                size: s,
+                token: t,
+                ..
             } => {
                 check(valid_name(session), "invalid session name")?;
+                token(t)?;
                 size(s)
             }
             StreamOpen::ExecIo { .. } => Ok(()),
             StreamOpen::PortForward { port } => check(*port != 0, "port 0"),
             StreamOpen::GitUploadPack { repo } => abs_path(repo),
         }
+    }
+}
+
+/// Host-side check of the guest's proxy stream header (hostile input).
+impl Validate for ProxyOpen {
+    fn validate(&self) -> Result<(), ProtoError> {
+        match self {
+            ProxyOpen::HttpProxy => Ok(()),
+            ProxyOpen::Direct { host, port, sni } => {
+                check(*port != 0, "port 0")?;
+                check(
+                    valid_hostname(host) || host.parse::<std::net::IpAddr>().is_ok(),
+                    "invalid destination host",
+                )?;
+                sni.as_deref()
+                    .map_or(Ok(()), |s| check(valid_hostname(s), "invalid SNI"))
+            }
+        }
+    }
+}
+
+impl Validate for GitOpen {
+    fn validate(&self) -> Result<(), ProtoError> {
+        Ok(())
     }
 }
 
@@ -572,6 +660,8 @@ pub fn decode_any_from_guest(payload: &[u8]) {
     let _ = decode::<StreamAck>(payload);
     let _ = decode::<AttachOut>(payload);
     let _ = decode::<ExecOut>(payload);
+    let _ = decode::<ProxyOpen>(payload);
+    let _ = decode::<GitOpen>(payload);
 }
 
 #[cfg(test)]
@@ -615,6 +705,7 @@ mod tests {
                 env: env.clone(),
                 cwd: "/work".into(),
                 pty: Some(sz()),
+                user: Some("dev".into()),
             },
             HostReq::SessionCreate {
                 name: "claude".into(),
@@ -622,6 +713,11 @@ mod tests {
                 env,
                 cwd: "/work".into(),
                 size: sz(),
+                user: None,
+            },
+            HostReq::AuthorizeAttach {
+                session: "claude".into(),
+                token: vec![7; ATTACH_TOKEN_LEN],
             },
             HostReq::SessionList,
             HostReq::SessionKill {
@@ -737,6 +833,16 @@ mod tests {
             session: "s".into(),
             size: sz(),
             replay_scrollback: true,
+            token: vec![1; ATTACH_TOKEN_LEN],
+        });
+        roundtrip(ProxyOpen::HttpProxy);
+        roundtrip(ProxyOpen::Direct {
+            host: "example.com".into(),
+            port: 443,
+            sni: Some("example.com".into()),
+        });
+        roundtrip(GitOpen {
+            service: GitService::UploadPack,
         });
         roundtrip(StreamOpen::ExecIo { exec_id: 9 });
         roundtrip(StreamOpen::PortForward { port: 8080 });
@@ -835,6 +941,25 @@ mod tests {
         }
         assert!(decode::<AttachOut>(&payload(&AttachOut::Data(vec![0; MAX_CHUNK + 1]))).is_err());
         assert!(decode::<ExecOut>(&payload(&ExecOut::Stdout(vec![0; MAX_CHUNK + 1]))).is_err());
+        for bad in [
+            ProxyOpen::Direct {
+                host: "a b".into(),
+                port: 1,
+                sni: None,
+            },
+            ProxyOpen::Direct {
+                host: "a".into(),
+                port: 0,
+                sni: None,
+            },
+            ProxyOpen::Direct {
+                host: "a".into(),
+                port: 1,
+                sni: Some("x\0".into()),
+            },
+        ] {
+            assert!(decode::<ProxyOpen>(&payload(&bad)).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

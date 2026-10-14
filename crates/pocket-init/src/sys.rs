@@ -308,3 +308,60 @@ pub fn getpid() -> i32 {
     // SAFETY: plain syscall.
     unsafe { libc::getpid() }
 }
+
+pub fn vsock_connect(cid: u32, port: u32) -> io::Result<File> {
+    // SAFETY: socket/connect on a fresh descriptor owned by the returned File.
+    unsafe {
+        let fd = cvt(libc::socket(
+            libc::AF_VSOCK,
+            libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+            0,
+        ))?;
+        let f = File::from_raw_fd(fd);
+        let mut addr: libc::sockaddr_vm = std::mem::zeroed();
+        addr.svm_family = libc::AF_VSOCK as libc::sa_family_t;
+        addr.svm_cid = cid;
+        addr.svm_port = port;
+        cvt(libc::connect(
+            fd,
+            (&addr as *const libc::sockaddr_vm).cast(),
+            std::mem::size_of::<libc::sockaddr_vm>() as libc::socklen_t,
+        ))?;
+        Ok(f)
+    }
+}
+
+/// Brings up `lo` (the guest has no other interface).
+pub fn loopback_up() -> io::Result<()> {
+    // SAFETY: ioctls on a local ifreq through a fresh socket owned by a File.
+    unsafe {
+        let fd = cvt(libc::socket(
+            libc::AF_INET,
+            libc::SOCK_DGRAM | libc::SOCK_CLOEXEC,
+            0,
+        ))?;
+        let _sock = File::from_raw_fd(fd);
+        let mut ifr: libc::ifreq = std::mem::zeroed();
+        for (i, b) in b"lo".iter().enumerate() {
+            ifr.ifr_name[i] = *b as libc::c_char;
+        }
+        cvt(libc::ioctl(fd, libc::SIOCGIFFLAGS as _, &mut ifr))?;
+        ifr.ifr_ifru.ifru_flags |= libc::IFF_UP as libc::c_short;
+        cvt(libc::ioctl(fd, libc::SIOCSIFFLAGS as _, &ifr))?;
+    }
+    Ok(())
+}
+
+pub fn lchown(path: &std::path::Path, uid: u32, gid: u32) -> io::Result<()> {
+    std::os::unix::fs::lchown(path, Some(uid), Some(gid))
+}
+
+pub fn fchown(f: &File, uid: u32, gid: u32) -> io::Result<()> {
+    // SAFETY: fchown on an open descriptor.
+    cvt(unsafe { libc::fchown(f.as_raw_fd(), uid, gid) }).map(drop)
+}
+
+/// Constant-time comparison for secrets.
+pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}

@@ -11,7 +11,7 @@ use pocket_proto::guest::{
     StreamAck, StreamOpen,
 };
 
-use crate::{exec, log, process, session, shutdown, sys};
+use crate::{exec, log, netshim, process, session, shutdown, sys};
 
 type Conn = Arc<Mutex<File>>;
 
@@ -111,7 +111,7 @@ fn handle(id: u64, req: HostReq) -> Result<Reply, GuestError> {
             rng_seed,
             time_unix_nanos,
             env,
-            proxy_port: _,
+            proxy_port,
         } => {
             sys::sethostname(&hostname).map_err(io_err("sethostname"))?;
             sys::add_entropy(&rng_seed).map_err(io_err("rng seed"))?;
@@ -121,6 +121,7 @@ fn handle(id: u64, req: HostReq) -> Result<Reply, GuestError> {
             *process::GLOBAL_ENV
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()) = env;
+            netshim::start(proxy_port).map_err(io_err("proxy shim"))?;
             Ok(Reply::Done)
         }
         HostReq::Exec {
@@ -128,15 +129,21 @@ fn handle(id: u64, req: HostReq) -> Result<Reply, GuestError> {
             env,
             cwd,
             pty,
-        } => exec::start(id, &argv, &env, &cwd, pty).map(|pid| Reply::ExecStarted { pid }),
+            user,
+        } => exec::start(id, &argv, &env, &cwd, pty, user.as_deref())
+            .map(|pid| Reply::ExecStarted { pid }),
         HostReq::SessionCreate {
             name,
             argv,
             env,
             cwd,
             size,
-        } => {
-            session::create(&name, &argv, &env, &cwd, size).map(|pid| Reply::SessionCreated { pid })
+            user,
+        } => session::create(&name, &argv, &env, &cwd, size, user.as_deref())
+            .map(|pid| Reply::SessionCreated { pid }),
+        HostReq::AuthorizeAttach { session, token } => {
+            session::authorize(&session, token);
+            Ok(Reply::Done)
         }
         HostReq::SessionList => Ok(Reply::Sessions(session::list())),
         HostReq::SessionKill { name, signal } => session::kill(&name, signal).map(|()| Reply::Done),
@@ -202,7 +209,8 @@ pub fn serve_stream(conn: File) {
             session,
             size,
             replay_scrollback,
-        } => session::attach(&session, size, replay_scrollback, conn),
+            token,
+        } => session::attach(&session, size, replay_scrollback, &token, conn),
         StreamOpen::ExecIo { exec_id } => exec::attach_io(exec_id, conn),
         StreamOpen::PortForward { .. } | StreamOpen::GitUploadPack { .. } => {
             let err = GuestError::new(

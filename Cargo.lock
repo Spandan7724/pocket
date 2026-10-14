@@ -90,6 +90,7 @@ version = "0.0.0"
 name = "pocket-guest"
 version = "0.0.0"
 dependencies = [
+ "libc",
  "pocket-proto",
 ]
 

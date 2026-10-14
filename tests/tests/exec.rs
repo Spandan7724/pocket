@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use pocket_proto::guest::{ErrorKind, ExecIn, ExecOut, ExitStatus, PtySize, StreamOpen};
-use pocket_tests::guest::{Control, Exec, exec, open_stream};
+use pocket_tests::guest::{Control, Exec, argv, exec, open_stream};
 use pocket_tests::{TestVm, VmOpts, kvm_or_skip};
 
 fn vm(tag: &str) -> Option<(TestVm, Control)> {
@@ -138,4 +138,37 @@ fn pty_exec_and_errors() {
         .err()
         .unwrap();
     assert_eq!(err.kind, ErrorKind::Unsupported);
+}
+
+#[test]
+fn exec_as_another_user() {
+    let Some(a) = kvm_or_skip() else { return };
+    let vm = TestVm::boot(&a, "user", VmOpts::default());
+    let u = &vm.vsock_uds;
+    let mut ctl = Control::connect(u, Duration::from_secs(10));
+    let id = ctl.send_req(pocket_proto::guest::HostReq::Exec {
+        argv: argv(&["/bin/sh", "-c", "id -u; id -g; echo $HOME $USER"]),
+        env: vec![],
+        cwd: "/".into(),
+        pty: None,
+        user: Some("nobody".into()),
+    });
+    assert!(ctl.wait_reply(id).is_ok());
+    let s = pocket_tests::guest::open_stream(
+        u,
+        pocket_proto::guest::StreamOpen::ExecIo { exec_id: id },
+    )
+    .unwrap();
+    let r = pocket_tests::guest::Exec::from_stream(s).finish();
+    assert_eq!(r.out(), "65534\n65534\n/ nobody\n");
+    let err = ctl
+        .request(pocket_proto::guest::HostReq::Exec {
+            argv: argv(&["/bin/true"]),
+            env: vec![],
+            cwd: "/".into(),
+            pty: None,
+            user: Some("ghost".into()),
+        })
+        .unwrap_err();
+    assert_eq!(err.kind, pocket_proto::guest::ErrorKind::NotFound);
 }
