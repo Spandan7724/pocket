@@ -16,6 +16,8 @@ pocket-proto = { path = "../crates/pocket-proto" }
 pocket-vmm = { path = "../crates/pocket-vmm" }
 pocket-image = { path = "../crates/pocket-image" }
 serde_json = "1"
+vt100 = "0.16"
+libc = "0.2"
 
 [dev-dependencies]
 libc = "0.2"

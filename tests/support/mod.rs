@@ -6,6 +6,7 @@
 
 pub mod cli;
 pub mod guest;
+pub mod pty;
 
 use std::fs;
 use std::path::{Path, PathBuf};
