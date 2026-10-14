@@ -11,6 +11,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 pocket-proto = { path = "../crates/pocket-proto" }
+pocket-net = { path = "../crates/pocket-net" }
 
 [[bin]]
 name = "guest_decoders"
@@ -22,6 +23,13 @@ bench = false
 [[bin]]
 name = "frame_reader"
 path = "fuzz_targets/frame_reader.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "proxy_parsers"
+path = "fuzz_targets/proxy_parsers.rs"
 test = false
 doc = false
 bench = false

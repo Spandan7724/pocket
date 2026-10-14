@@ -108,6 +108,10 @@ async fn read_head<S: AsyncRead + Unpin>(s: &mut S) -> io::Result<Option<Head>> 
         }
         buf.extend_from_slice(&chunk[..n]);
     };
+    parse_head(&buf, end).map(Some)
+}
+
+fn parse_head(buf: &[u8], end: usize) -> io::Result<Head> {
     let text = std::str::from_utf8(&buf[..end])
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "non-UTF-8 request head"))?;
     let mut lines = text.split("\r\n");
@@ -146,13 +150,32 @@ async fn read_head<S: AsyncRead + Unpin>(s: &mut S) -> io::Result<Option<Head>> 
         }
         headers.push((k.to_string(), v.trim().to_string()));
     }
-    Ok(Some(Head {
+    Ok(Head {
         method: method.into(),
         target: target.into(),
         version: version.into(),
         headers,
         rest: buf[end + 4..].to_vec(),
-    }))
+    })
+}
+
+/// Every parser the proxy runs on guest bytes before any policy check; the fuzz target
+/// drives this.
+pub fn fuzz_parsers(data: &[u8]) {
+    let _ = sni::client_hello_sni(data);
+    let Some(end) = data.windows(4).position(|w| w == b"\r\n\r\n") else {
+        return;
+    };
+    if let Ok(h) = parse_head(data, end) {
+        let _ = split_authority(&h.target, None);
+        let _ = split_authority(&h.target, Some(80));
+        for (_, v) in &h.headers {
+            let _ = split_authority(v, Some(80));
+        }
+        if let Some(rest) = h.target.strip_prefix("http://") {
+            let _ = split_authority(rest.split('/').next().unwrap_or(""), Some(80));
+        }
+    }
 }
 
 /// `host:port` with optional `[v6]`; `default` when the port is absent.
