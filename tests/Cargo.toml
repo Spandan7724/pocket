@@ -14,6 +14,7 @@ path = "support/mod.rs"
 [dependencies]
 pocket-proto = { path = "../crates/pocket-proto" }
 pocket-vmm = { path = "../crates/pocket-vmm" }
+pocket-image = { path = "../crates/pocket-image" }
 
 [dev-dependencies]
 libc = "0.2"
