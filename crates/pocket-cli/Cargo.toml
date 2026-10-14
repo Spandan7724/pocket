@@ -16,4 +16,4 @@ workspace = true
 
 [dependencies]
 pocket-tui = { path = "../pocket-tui" }
-pocket-proto = { path = "../pocket-proto" }
+pocket-proto = { path = "../pocket-proto", features = ["rpc"] }

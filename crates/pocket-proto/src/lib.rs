@@ -6,6 +6,8 @@
 
 pub mod frame;
 pub mod guest;
+#[cfg(feature = "rpc")]
+pub mod rpc;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProtoError {

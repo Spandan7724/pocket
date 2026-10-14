@@ -11,4 +11,4 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
-pocket-proto = { path = "../pocket-proto" }
+pocket-proto = { path = "../pocket-proto", features = ["rpc"] }

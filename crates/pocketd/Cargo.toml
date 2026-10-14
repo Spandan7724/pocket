@@ -16,4 +16,4 @@ pocket-image = { path = "../pocket-image" }
 pocket-net = { path = "../pocket-net" }
 pocket-git = { path = "../pocket-git" }
 pocket-store = { path = "../pocket-store" }
-pocket-proto = { path = "../pocket-proto" }
+pocket-proto = { path = "../pocket-proto", features = ["rpc"] }

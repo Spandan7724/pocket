@@ -1,0 +1,402 @@
+//! CLI ↔ daemon RPC (CONTRACTS.md §2): UDS, frames of `u32` big-endian length + JSON.
+//!
+//! The client sends [`ClientMsg::Hello`] first; the daemon answers [`DaemonMsg::Hello`]
+//! or closes after a `VersionMismatch` error response with id 0.
+
+use std::io::{self, Read, Write};
+use std::path::PathBuf;
+
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+
+use crate::guest::{ExitStatus, SessionInfo};
+
+/// Bump on every incompatible change to the types in this module.
+pub const RPC_VERSION: u32 = 1;
+pub const MAX_RPC_FRAME: usize = 16 << 20;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ClientMsg {
+    Hello { proto_version: u32, client: String },
+    Request { id: u64, req: Request },
+    Subscribe { id: u64, topics: Vec<Topic> },
+    Cancel { id: u64 },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum DaemonMsg {
+    Hello {
+        proto_version: u32,
+        daemon_version: String,
+    },
+    Response {
+        id: u64,
+        result: Result<Response, RpcError>,
+    },
+    Progress {
+        id: u64,
+        stage: String,
+        pct: Option<u8>,
+    },
+    /// `seq` is monotonic per daemon run.
+    Event { seq: u64, event: Event },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Topic {
+    Pockets,
+    Net,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NewPocket {
+    pub name: Option<String>,
+    pub preset: Option<String>,
+    /// Host repository to clone in; `None` = scratch pocket.
+    pub repo: Option<PathBuf>,
+    /// Copy uncommitted host changes (tracked diffs + untracked files) into `/work`.
+    pub carry_changes: bool,
+    pub cpus: Option<u8>,
+    pub memory_mib: Option<u32>,
+    pub disk_mib: Option<u64>,
+    pub net_profile: Option<String>,
+    pub allow: Vec<String>,
+    /// Default session command; `None` = login shell.
+    pub command: Option<Vec<String>>,
+    pub term: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Request {
+    NewPocket(NewPocket),
+    List,
+    Stop {
+        pocket: String,
+    },
+    Start {
+        pocket: String,
+    },
+    Remove {
+        pocket: String,
+    },
+    /// Starts a one-shot process; the client then opens `ExecIo` on `vsock_uds`.
+    Exec {
+        pocket: String,
+        argv: Vec<String>,
+        env: Vec<(String, String)>,
+        cwd: Option<String>,
+        tty: Option<(u16, u16)>,
+        root: bool,
+    },
+    SessionCreate {
+        pocket: String,
+        name: Option<String>,
+        argv: Option<Vec<String>>,
+        rows: u16,
+        cols: u16,
+        term: Option<String>,
+    },
+    SessionList {
+        pocket: String,
+    },
+    SessionKill {
+        pocket: String,
+        session: String,
+        signal: i32,
+    },
+    /// One-time token for the direct attach fast path; `session` `None` = most recent.
+    AttachAuthorize {
+        pocket: String,
+        session: Option<String>,
+    },
+    NetLog {
+        pocket: String,
+        limit: u32,
+    },
+    Pull {
+        preset: String,
+    },
+    Doctor,
+    /// Stops the daemon (VMs keep running and are re-adopted on the next start).
+    DaemonStop,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum Response {
+    Done,
+    Pocket(PocketInfo),
+    Pockets(Vec<PocketInfo>),
+    ExecStarted {
+        exec_id: u64,
+        vsock_uds: PathBuf,
+    },
+    Session {
+        name: String,
+    },
+    Sessions(Vec<SessionInfo>),
+    Attach {
+        session: String,
+        vsock_uds: PathBuf,
+        token: Vec<u8>,
+    },
+    NetLog(Vec<NetEntry>),
+    Image {
+        name: String,
+        digest: String,
+    },
+    Doctor(Vec<Check>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PocketState {
+    Creating,
+    Running,
+    Paused,
+    Hibernated,
+    Stopped,
+    Broken { reason: String },
+}
+
+impl PocketState {
+    pub fn label(&self) -> &str {
+        match self {
+            PocketState::Creating => "creating",
+            PocketState::Running => "running",
+            PocketState::Paused => "paused",
+            PocketState::Hibernated => "hibernated",
+            PocketState::Stopped => "stopped",
+            PocketState::Broken { .. } => "broken",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PocketInfo {
+    pub id: String,
+    pub name: String,
+    pub state: PocketState,
+    pub preset: String,
+    pub image_digest: String,
+    pub repo_path: Option<PathBuf>,
+    pub base_ref: Option<String>,
+    pub branch: Option<String>,
+    pub vcpus: u8,
+    pub memory_mib: u32,
+    pub disk_bytes: u64,
+    /// Bytes actually allocated by the pocket disk (sparse file).
+    pub disk_used_bytes: u64,
+    pub net_profile: String,
+    pub created_at: u64,
+    pub last_active_at: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Verdict {
+    Allowed,
+    Denied,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetEntry {
+    pub pocket: String,
+    pub ts_ms: u64,
+    /// `connect` (HTTPS tunnel) or `http` (plain request).
+    pub kind: String,
+    pub host: String,
+    pub ip: Option<String>,
+    pub port: u16,
+    pub method: Option<String>,
+    pub path: Option<String>,
+    pub status: Option<u16>,
+    pub bytes_up: u64,
+    pub bytes_down: u64,
+    pub verdict: Verdict,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Check {
+    pub name: String,
+    pub ok: bool,
+    /// Warnings don't fail `doctor`.
+    pub warn: bool,
+    pub detail: String,
+    pub fix: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum Event {
+    PocketState {
+        name: String,
+        from: PocketState,
+        to: PocketState,
+        at: u64,
+    },
+    Net(NetEntry),
+    SessionExited {
+        pocket: String,
+        session: String,
+        status: ExitStatus,
+    },
+}
+
+/// Stable error codes; each maps to a documented CLI exit code (CLI.md §Exit codes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ErrorCode {
+    BadRequest,
+    NotFound,
+    AlreadyExists,
+    VersionMismatch,
+    InvalidState,
+    HostSetup,
+    Vmm,
+    Guest,
+    Image,
+    Workspace,
+    Internal,
+}
+
+impl ErrorCode {
+    pub fn exit_code(self) -> u8 {
+        match self {
+            ErrorCode::BadRequest => 2,
+            ErrorCode::NotFound => 3,
+            ErrorCode::AlreadyExists => 4,
+            ErrorCode::InvalidState => 5,
+            ErrorCode::VersionMismatch => 6,
+            ErrorCode::HostSetup => 7,
+            ErrorCode::Vmm | ErrorCode::Guest => 8,
+            ErrorCode::Image => 9,
+            ErrorCode::Workspace => 10,
+            ErrorCode::Internal => 70,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RpcError {
+    pub code: ErrorCode,
+    /// What happened.
+    pub message: String,
+    /// How to fix it.
+    pub hint: Option<String>,
+}
+
+impl RpcError {
+    pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
+        RpcError {
+            code,
+            message: message.into(),
+            hint: None,
+        }
+    }
+
+    pub fn hint(mut self, hint: impl Into<String>) -> Self {
+        self.hint = Some(hint.into());
+        self
+    }
+}
+
+impl std::fmt::Display for RpcError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for RpcError {}
+
+pub fn encode<T: Serialize>(msg: &T) -> io::Result<Vec<u8>> {
+    let json = serde_json::to_vec(msg).map_err(io::Error::other)?;
+    if json.len() > MAX_RPC_FRAME {
+        return Err(io::Error::other("rpc frame too large"));
+    }
+    let mut out = (json.len() as u32).to_be_bytes().to_vec();
+    out.extend(json);
+    Ok(out)
+}
+
+pub fn decode<T: DeserializeOwned>(payload: &[u8]) -> io::Result<T> {
+    serde_json::from_slice(payload).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+/// Length of the frame starting with this prefix, rejecting oversized frames.
+pub fn frame_len(prefix: [u8; 4]) -> io::Result<usize> {
+    let len = u32::from_be_bytes(prefix) as usize;
+    if len > MAX_RPC_FRAME {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "rpc frame too large",
+        ));
+    }
+    Ok(len)
+}
+
+pub fn write<W: Write, T: Serialize>(w: &mut W, msg: &T) -> io::Result<()> {
+    w.write_all(&encode(msg)?)
+}
+
+/// `Ok(None)` on a clean EOF.
+pub fn read<R: Read, T: DeserializeOwned>(r: &mut R) -> io::Result<Option<T>> {
+    let mut len = [0u8; 4];
+    match r.read_exact(&mut len) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e),
+    }
+    let mut buf = vec![0u8; frame_len(len)?];
+    r.read_exact(&mut buf)?;
+    decode(&buf).map(Some)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn roundtrip_and_limits() {
+        let msgs = vec![
+            ClientMsg::Hello {
+                proto_version: RPC_VERSION,
+                client: "pocket 0.0.0".into(),
+            },
+            ClientMsg::Request {
+                id: 1,
+                req: Request::NewPocket(NewPocket {
+                    name: Some("a".into()),
+                    preset: None,
+                    repo: Some("/r".into()),
+                    carry_changes: true,
+                    cpus: Some(2),
+                    memory_mib: None,
+                    disk_mib: None,
+                    net_profile: Some("dev".into()),
+                    allow: vec!["x.com".into()],
+                    command: None,
+                    term: Some("xterm".into()),
+                }),
+            },
+            ClientMsg::Subscribe {
+                id: 2,
+                topics: vec![Topic::Net],
+            },
+        ];
+        for m in msgs {
+            let mut buf = vec![];
+            write(&mut buf, &m).unwrap();
+            let back: ClientMsg = read(&mut buf.as_slice()).unwrap().unwrap();
+            assert_eq!(back, m);
+        }
+        let err = DaemonMsg::Response {
+            id: 3,
+            result: Err(RpcError::new(ErrorCode::NotFound, "no pocket x").hint("pocket ls")),
+        };
+        let mut buf = vec![];
+        write(&mut buf, &err).unwrap();
+        assert_eq!(
+            read::<_, DaemonMsg>(&mut buf.as_slice()).unwrap().unwrap(),
+            err
+        );
+        assert!(frame_len(((MAX_RPC_FRAME + 1) as u32).to_be_bytes()).is_err());
+        assert!(read::<_, DaemonMsg>(&mut &[][..]).unwrap().is_none());
+    }
+}

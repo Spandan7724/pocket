@@ -11,3 +11,6 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+pocket-proto = { path = "../pocket-proto", features = ["rpc"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
+thiserror = "2"
