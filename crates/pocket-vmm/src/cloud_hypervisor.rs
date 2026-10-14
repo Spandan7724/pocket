@@ -98,22 +98,20 @@ pub struct CloudHypervisor {
 }
 
 impl CloudHypervisor {
-    /// Probes `binary --version` (`cloud-hypervisor v54.0.0…`).
+    /// Probes `binary --version` (`cloud-hypervisor v54.0.0…`); a missing binary gives
+    /// version `missing` and fails at `create` (so `pocket doctor` can still report it).
     pub fn new(binary: PathBuf) -> Result<Self, VmmError> {
-        let out = Command::new(&binary)
+        let version = Command::new(&binary)
             .arg("--version")
             .output()
-            .map_err(|source| VmmError::Spawn {
-                binary: binary.clone(),
-                source,
-            })?;
-        let text = String::from_utf8_lossy(&out.stdout);
-        let version = text
-            .split_whitespace()
-            .nth(1)
-            .unwrap_or("unknown")
-            .trim_start_matches('v')
-            .to_string();
+            .ok()
+            .and_then(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .split_whitespace()
+                    .nth(1)
+                    .map(|v| v.trim_start_matches('v').to_string())
+            })
+            .unwrap_or_else(|| "missing".into());
         Ok(CloudHypervisor { binary, version })
     }
 

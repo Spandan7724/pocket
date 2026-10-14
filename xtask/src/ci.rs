@@ -106,9 +106,14 @@ pub const PRESETS: &[&str] = &["base", "claude", "codex"];
 /// when the preset scripts are unchanged). Expects isolated XDG dirs.
 pub fn presets() -> Result {
     step("pocket binaries");
-    run(Command::new(env!("CARGO"))
-        .current_dir(root())
-        .args(["build", "--locked", "-p", "pocket-cli", "-p", "pocketd"]))?;
+    run(Command::new(env!("CARGO")).current_dir(root()).args([
+        "build",
+        "--locked",
+        "-p",
+        "pocket-cli",
+        "-p",
+        "pocketd",
+    ]))?;
     step("preset images");
     if !Path::new("/dev/kvm").exists() {
         eprintln!("SKIPPED: preset images need /dev/kvm");
@@ -123,7 +128,9 @@ pub fn presets() -> Result {
             .env("POCKETD", bin.join("pocketd"));
         c
     };
-    let res = PRESETS.iter().try_for_each(|p| run(&mut pocket(&["pull", p])));
+    let res = PRESETS
+        .iter()
+        .try_for_each(|p| run(&mut pocket(&["pull", p])));
     let _ = status(&mut pocket(&["daemon", "stop"]));
     res
 }

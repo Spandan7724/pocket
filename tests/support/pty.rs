@@ -131,8 +131,31 @@ impl Pty {
         false
     }
 
+    /// Screen rows as text.
+    pub fn rows(&self) -> Vec<String> {
+        let p = self.screen.lock().unwrap();
+        let (_, cols) = p.screen().size();
+        p.screen().rows(0, cols).collect()
+    }
+
     pub fn contents(&self) -> String {
         self.screen.lock().unwrap().screen().contents()
+    }
+
+    pub fn wait_rows(&self, pred: impl Fn(&[String]) -> bool, timeout: Duration) -> Vec<String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let r = self.rows();
+            if pred(&r) {
+                return r;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "screen never matched:\n{}",
+                r.join("\n")
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     pub fn wait_screen(&self, pred: impl Fn(&str) -> bool, timeout: Duration) -> String {

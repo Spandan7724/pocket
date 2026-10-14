@@ -15,14 +15,18 @@ fn pull_oci_image_to_erofs_boot_it_and_hit_the_cache() {
     };
     let t = Instant::now();
     let first = store
-        .pull("public.ecr.aws/docker/library/alpine:3.22", &|s| eprintln!("pull: {s}"))
+        .pull("public.ecr.aws/docker/library/alpine:3.22", &|s| {
+            eprintln!("pull: {s}")
+        })
         .unwrap();
     eprintln!("first pull {:?}: {first:?}", t.elapsed());
     assert!(!first.cache_hit);
     assert_eq!(std::fs::metadata(&first.path).unwrap().len() % (2 << 20), 0);
 
     let t = Instant::now();
-    let second = store.pull("public.ecr.aws/docker/library/alpine:3.22", &|_| {}).unwrap();
+    let second = store
+        .pull("public.ecr.aws/docker/library/alpine:3.22", &|_| {})
+        .unwrap();
     eprintln!(
         "second pull by tag {:?}: cache_hit={}",
         t.elapsed(),
@@ -31,9 +35,10 @@ fn pull_oci_image_to_erofs_boot_it_and_hit_the_cache() {
     assert!(second.cache_hit);
     assert_eq!(second.digest, first.digest);
     let by_digest = store
-        .pull(&format!("public.ecr.aws/docker/library/alpine@{}", first.digest), &|_| {
-            panic!("no network expected")
-        })
+        .pull(
+            &format!("public.ecr.aws/docker/library/alpine@{}", first.digest),
+            &|_| panic!("no network expected"),
+        )
         .unwrap();
     assert!(by_digest.cache_hit);
 

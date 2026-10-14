@@ -176,3 +176,132 @@ fn rpc_handshake_rejects_version_mismatch() {
         "{reply}"
     );
 }
+
+#[test]
+fn doctor_reports_checks_and_fixes() {
+    let Some(assets) = assets() else { return };
+    let env = Env::new("doctor", &assets);
+    let out = env.ok(&["doctor"]);
+    for name in [
+        "kvm",
+        "cgroups",
+        "reflink",
+        "disk space",
+        "assets",
+        "versions",
+        "mkfs.erofs",
+    ] {
+        assert!(
+            out.lines().any(|l| l
+                .split_whitespace()
+                .skip(1)
+                .collect::<Vec<_>>()
+                .join(" ")
+                .starts_with(name)),
+            "{name} missing:\n{out}"
+        );
+    }
+    assert!(
+        out.contains("guest protocol v2") && out.contains("cloud-hypervisor 54"),
+        "{out}"
+    );
+    let checks = env.json(&["doctor"]);
+    assert!(
+        checks
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|c| c["ok"] == true || c["fix"].is_string())
+    );
+
+    // Broken host: no KVM device, no assets. Every failure says how to fix it.
+    let mut broken = Env::new("doctor-bad", &assets.join("nope"));
+    broken
+        .extra
+        .push(("POCKET_DOCTOR_KVM".into(), "/nonexistent/kvm".into()));
+    let o = broken.pocket(&["doctor"]);
+    assert_eq!(o.status.code(), Some(1));
+    let text = String::from_utf8_lossy(&o.stdout);
+    for line in ["✗ kvm", "✗ assets"] {
+        let i = text
+            .find(line)
+            .unwrap_or_else(|| panic!("{line} missing:\n{text}"));
+        let next = text[i..].lines().nth(1).unwrap();
+        assert!(
+            next.trim_start().starts_with("fix:"),
+            "no fix after {line}:\n{text}"
+        );
+    }
+}
+
+#[test]
+fn errors_say_what_happened_and_how_to_fix_it() {
+    let Some(assets) = assets() else { return };
+    let env = Env::new("errors", &assets);
+    let cases: &[(&[&str], i32, &str, &str)] = &[
+        (
+            &["exec", "nope", "--", "true"],
+            3,
+            "no pocket named \"nope\"",
+            "pocket ls",
+        ),
+        (
+            &["new", "Bad_Name", "--no-repo", "--preset", "test"],
+            2,
+            "invalid pocket name",
+            "lowercase",
+        ),
+        (
+            &["new", "x", "--no-repo", "--preset", "nosuch"],
+            2,
+            "unknown preset",
+            "available presets",
+        ),
+        (
+            &["new", "x", "--no-repo", "--preset", "test", "--net", "wide"],
+            2,
+            "unknown network profile",
+            "dev, strict, offline",
+        ),
+        (
+            &[
+                "new",
+                "x",
+                "--no-repo",
+                "--preset",
+                "test",
+                "--allow",
+                "a*b",
+            ],
+            2,
+            "invalid rule",
+            "",
+        ),
+        (
+            &["new", "x", "--repo", "/", "--preset", "test"],
+            10,
+            "not inside a git work tree",
+            "--no-repo",
+        ),
+        (&["kill", "x"], 2, "name the session", ""),
+        (
+            &["new", "--mem", "lots", "--preset", "test"],
+            2,
+            "invalid size",
+            "4G",
+        ),
+    ];
+    for (args, code, what, hint) in cases {
+        let o = env.pocket(args);
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert_eq!(o.status.code(), Some(*code), "{args:?}: {err}");
+        assert!(err.contains(what), "{args:?}: {err}");
+        assert!(err.contains('×'), "miette rendering: {err}");
+        if !hint.is_empty() {
+            assert!(
+                err.contains("help:") && err.contains(hint),
+                "{args:?}: {err}"
+            );
+        }
+    }
+}

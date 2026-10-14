@@ -44,16 +44,17 @@ fn tool_version(cmd: &str, arg: &str) -> Option<String> {
 
 pub fn checks(d: &Daemon) -> Vec<Check> {
     let mut v = vec![];
+    let dev = std::env::var("POCKET_DOCTOR_KVM").unwrap_or_else(|_| "/dev/kvm".into());
     let kvm = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
-        .open("/dev/kvm");
+        .open(&dev);
     v.push(check(
         "kvm",
         kvm.is_ok(),
         match &kvm {
-            Ok(_) => "/dev/kvm is read-writable".to_string(),
-            Err(e) => format!("/dev/kvm: {e}"),
+            Ok(_) => format!("{dev} is read-writable"),
+            Err(e) => format!("{dev}: {e}"),
         },
         Some("enable virtualization in the firmware, load kvm_intel/kvm_amd, and add yourself to the kvm group: `sudo usermod -aG kvm $USER` (log in again)"),
     ));
