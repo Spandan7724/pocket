@@ -289,17 +289,11 @@ async fn build(
             .exec_to(
                 ExecReq {
                     argv: &[
-                        "tar",
-                        "--numeric-owner",
-                        "--xattrs",
-                        "--xattrs-include=*",
-                        "--acls",
-                        "--one-file-system",
-                        "-C",
-                        "/",
-                        "-cf",
-                        "-",
-                        ".",
+                        "/bin/sh",
+                        "-c",
+                        // GNU tar exits 1 when mount points change under it; that is fine.
+                        "tar --numeric-owner --xattrs '--xattrs-include=*' --acls --one-file-system \
+                         --warning=no-file-changed -C / -cf - . ; [ $? -le 1 ]",
                     ],
                     env: vec![],
                     cwd: "/",

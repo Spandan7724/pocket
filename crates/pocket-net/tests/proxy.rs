@@ -75,14 +75,24 @@ async fn harness(policy: Policy) -> Harness {
             let got = got.clone();
             tokio::spawn(async move {
                 let mut buf = vec![0u8; 65536];
-                let n = s.read(&mut buf).await.unwrap_or(0);
-                got.lock().unwrap().push(buf[..n].to_vec());
-                if buf.starts_with(b"GET ") {
-                    let _ = s
-                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello")
-                        .await;
-                } else {
-                    let _ = s.write_all(b"tls-reply").await;
+                loop {
+                    let n = s.read(&mut buf).await.unwrap_or(0);
+                    got.lock().unwrap().push(buf[..n].to_vec());
+                    if n == 0 {
+                        break;
+                    }
+                    if buf.starts_with(b"GET /chunked") {
+                        let _ = s
+                            .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n")
+                            .await;
+                    } else if buf.starts_with(b"GET ") {
+                        let _ = s
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello")
+                            .await;
+                    } else {
+                        let _ = s.write_all(b"tls-reply").await;
+                        break;
+                    }
                 }
             });
         }
@@ -300,10 +310,7 @@ async fn plain_http_is_rewritten_and_logged() {
     assert!(out.ends_with("hello"), "{out}");
     let sent = String::from_utf8(h.upstream_got.lock().unwrap()[0].clone()).unwrap();
     assert!(sent.starts_with("GET /a/b?c=1 HTTP/1.1\r\n"), "{sent}");
-    assert!(
-        sent.contains("Connection: close\r\n") && !sent.to_lowercase().contains("proxy-connection"),
-        "{sent}"
-    );
+    assert!(!sent.to_lowercase().contains("proxy-connection"), "{sent}");
     let e = h.log.lock().unwrap()[0].clone();
     assert_eq!(
         (e.verdict, e.status, e.method.as_deref(), e.path.as_deref()),
@@ -338,4 +345,62 @@ async fn plain_http_is_rewritten_and_logged() {
         log.iter().filter(|e| e.verdict == Verdict::Denied).count(),
         3
     );
+}
+
+#[tokio::test]
+async fn plain_http_keep_alive_reuses_the_upstream_and_logs_each_request() {
+    let mut pol = Policy::profile("strict").unwrap();
+    pol.allow.push(Rule::parse("allowed.test").unwrap());
+    let h = harness(pol).await;
+    let (mut client, server) = duplex(1 << 20);
+    let task = tokio::spawn(serve(server, h.ctx.clone()));
+    let mut buf = vec![0u8; 4096];
+    let mut read_until = async |client: &mut tokio::io::DuplexStream, needle: &str| {
+        let mut out = String::new();
+        while !out.contains(needle) {
+            let n = client.read(&mut buf).await.unwrap();
+            assert!(n > 0, "closed early: {out}");
+            out.push_str(&String::from_utf8_lossy(&buf[..n]));
+        }
+        out
+    };
+    client
+        .write_all(b"GET http://allowed.test/one HTTP/1.1\r\nHost: allowed.test\r\n\r\n")
+        .await
+        .unwrap();
+    read_until(&mut client, "hello").await;
+    client
+        .write_all(b"GET http://allowed.test/chunked HTTP/1.1\r\nHost: allowed.test\r\n\r\n")
+        .await
+        .unwrap();
+    let out = read_until(&mut client, "0\r\n\r\n").await;
+    assert!(out.contains("3\r\nabc\r\n2\r\nde\r\n"), "{out}");
+    // A request to a host outside the policy on the same connection is still blocked.
+    client
+        .write_all(b"GET http://example.org/ HTTP/1.1\r\nHost: example.org\r\n\r\n")
+        .await
+        .unwrap();
+    let out = read_until(&mut client, "blocked by pocket").await;
+    assert!(out.starts_with("HTTP/1.1 403"), "{out}");
+    client.shutdown().await.unwrap();
+    task.await.unwrap();
+    assert_eq!(
+        h.conn.seen.lock().unwrap().len(),
+        1,
+        "one upstream connection for both requests"
+    );
+    let log = h.log.lock().unwrap();
+    let paths: Vec<_> = log
+        .iter()
+        .map(|e| (e.path.clone().unwrap_or_default(), e.verdict))
+        .collect();
+    assert_eq!(
+        paths,
+        [
+            ("/one".into(), Verdict::Allowed),
+            ("/chunked".into(), Verdict::Allowed),
+            ("/".into(), Verdict::Denied)
+        ]
+    );
+    assert_eq!(log[1].status, Some(200));
 }

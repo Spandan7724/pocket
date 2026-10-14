@@ -86,7 +86,13 @@ struct Head {
 }
 
 async fn read_head<S: AsyncRead + Unpin>(s: &mut S) -> io::Result<Option<Head>> {
-    let mut buf = Vec::with_capacity(4096);
+    read_head_with(s, Vec::with_capacity(4096)).await
+}
+
+async fn read_head_with<S: AsyncRead + Unpin>(
+    s: &mut S,
+    mut buf: Vec<u8>,
+) -> io::Result<Option<Head>> {
     let mut chunk = [0u8; 4096];
     let end = loop {
         if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
@@ -312,6 +318,7 @@ where
     let o = if head.method == "CONNECT" {
         connect(&mut guest, head, &ctx).await
     } else {
+        // Logs each request itself.
         plain(&mut guest, head, &ctx).await
     };
     if let Some(o) = o {
@@ -413,21 +420,232 @@ const HOP_BY_HOP: &[&str] = &[
     "proxy-authorization",
     "proxy-authenticate",
     "upgrade",
+    "te",
+    "expect",
 ];
+const IDLE: Duration = Duration::from_secs(60);
+const MAX_LINE: usize = 8 * 1024;
 
-async fn plain<S>(guest: &mut S, head: Head, ctx: &ProxyCtx) -> Option<Outcome>
+fn bad_data(msg: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, msg)
+}
+
+/// A reader with bytes already pulled off the socket in front of it.
+struct Src<'a, R> {
+    r: &'a mut R,
+    buf: Vec<u8>,
+}
+
+impl<R: AsyncRead + Unpin> Src<'_, R> {
+    async fn fill(&mut self) -> io::Result<bool> {
+        let mut chunk = [0u8; 16 * 1024];
+        let n = self.r.read(&mut chunk).await?;
+        self.buf.extend_from_slice(&chunk[..n]);
+        Ok(n > 0)
+    }
+
+    async fn line(&mut self) -> io::Result<Vec<u8>> {
+        loop {
+            if let Some(i) = self.buf.windows(2).position(|w| w == b"\r\n") {
+                let l = self.buf[..i + 2].to_vec();
+                self.buf.drain(..i + 2);
+                return Ok(l);
+            }
+            if self.buf.len() > MAX_LINE {
+                return Err(bad_data("line too long"));
+            }
+            if !self.fill().await? {
+                return Err(io::ErrorKind::UnexpectedEof.into());
+            }
+        }
+    }
+
+    async fn copy_n<W: AsyncWrite + Unpin>(&mut self, mut n: u64, w: &mut W) -> io::Result<u64> {
+        let total = n;
+        while n > 0 {
+            if self.buf.is_empty() && !self.fill().await? {
+                return Err(io::ErrorKind::UnexpectedEof.into());
+            }
+            let k = (n as usize).min(self.buf.len());
+            w.write_all(&self.buf[..k]).await?;
+            self.buf.drain(..k);
+            n -= k as u64;
+        }
+        Ok(total)
+    }
+
+    async fn copy_chunked<W: AsyncWrite + Unpin>(&mut self, w: &mut W) -> io::Result<u64> {
+        let mut total = 0;
+        loop {
+            let l = self.line().await?;
+            let text = std::str::from_utf8(&l).map_err(|_| bad_data("bad chunk size"))?;
+            let size = text.trim().split(';').next().unwrap_or("").trim();
+            let size = u64::from_str_radix(size, 16).map_err(|_| bad_data("bad chunk size"))?;
+            w.write_all(&l).await?;
+            total += l.len() as u64;
+            if size == 0 {
+                loop {
+                    let t = self.line().await?;
+                    w.write_all(&t).await?;
+                    total += t.len() as u64;
+                    if t == b"\r\n" {
+                        return Ok(total);
+                    }
+                }
+            }
+            total += self.copy_n(size + 2, w).await?;
+        }
+    }
+
+    async fn copy_to_end<W: AsyncWrite + Unpin>(&mut self, w: &mut W) -> io::Result<u64> {
+        let mut total = self.buf.len() as u64;
+        w.write_all(&self.buf).await?;
+        self.buf.clear();
+        total += tokio::io::copy(self.r, w).await?;
+        Ok(total)
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum Framing {
+    Empty,
+    Length(u64),
+    Chunked,
+    UntilClose,
+}
+
+fn header<'a>(h: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    h.iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v.as_str())
+}
+
+fn has_token(h: &[(String, String)], name: &str, token: &str) -> bool {
+    h.iter()
+        .filter(|(k, _)| k.eq_ignore_ascii_case(name))
+        .any(|(_, v)| v.split(',').any(|t| t.trim().eq_ignore_ascii_case(token)))
+}
+
+fn body_framing(h: &[(String, String)], request: bool) -> io::Result<Framing> {
+    if has_token(h, "transfer-encoding", "chunked") {
+        return Ok(Framing::Chunked);
+    }
+    if header(h, "transfer-encoding").is_some() {
+        return Err(bad_data("unsupported transfer-encoding"));
+    }
+    let lens: Vec<&str> = h
+        .iter()
+        .filter(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+        .map(|(_, v)| v.as_str())
+        .collect();
+    match lens.as_slice() {
+        [] if request => Ok(Framing::Empty),
+        [] => Ok(Framing::UntilClose),
+        [l] => l
+            .trim()
+            .parse()
+            .map(Framing::Length)
+            .map_err(|_| bad_data("bad content-length")),
+        _ => Err(bad_data("several content-length headers")),
+    }
+}
+
+struct RespHead {
+    raw: Vec<u8>,
+    status: u16,
+    headers: Vec<(String, String)>,
+}
+
+async fn read_resp_head<R: AsyncRead + Unpin>(src: &mut Src<'_, R>) -> io::Result<RespHead> {
+    let mut raw = vec![];
+    loop {
+        let l = src.line().await?;
+        raw.extend_from_slice(&l);
+        if l == b"\r\n" {
+            break;
+        }
+        if raw.len() > MAX_HEAD {
+            return Err(bad_data("response head too large"));
+        }
+    }
+    let text = String::from_utf8_lossy(&raw);
+    let mut lines = text.split("\r\n");
+    let status = lines
+        .next()
+        .and_then(|l| l.split(' ').nth(1))
+        .and_then(|c| c.parse().ok())
+        .ok_or_else(|| bad_data("bad status line"))?;
+    let headers = lines
+        .filter_map(|l| l.split_once(':'))
+        .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+        .collect();
+    Ok(RespHead {
+        raw,
+        status,
+        headers,
+    })
+}
+
+struct UpstreamConn {
+    host: String,
+    port: u16,
+    io: Box<dyn Upstream>,
+    buf: Vec<u8>,
+}
+
+/// Plain-HTTP proxying with keep-alive: every request on the guest connection is checked
+/// and logged on its own; upstream connections are reused while the target stays the same.
+async fn plain<S>(guest: &mut S, first: Head, ctx: &ProxyCtx) -> Option<Outcome>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut next = Some(first);
+    let mut up: Option<UpstreamConn> = None;
+    let mut leftover = Vec::new();
+    loop {
+        let head = match next.take() {
+            Some(h) => h,
+            None => {
+                match tokio::time::timeout(
+                    IDLE,
+                    read_head_with(guest, std::mem::take(&mut leftover)),
+                )
+                .await
+                {
+                    Ok(Ok(Some(h))) => h,
+                    _ => return None,
+                }
+            }
+        };
+        let (o, keep) = one_request(guest, head, ctx, &mut up, &mut leftover).await;
+        if let Some(o) = o {
+            (ctx.log)(o.entry);
+        }
+        if !keep {
+            return None;
+        }
+    }
+}
+
+/// Returns the log entry and whether the guest connection stays open.
+async fn one_request<S>(
+    guest: &mut S,
+    head: Head,
+    ctx: &ProxyCtx,
+    up: &mut Option<UpstreamConn>,
+    leftover: &mut Vec<u8>,
+) -> (Option<Outcome>, bool)
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let Some(rest) = head.target.strip_prefix("http://") else {
-        respond(
-            guest,
-            400,
-            "Bad Request",
-            "pocket proxy: only CONNECT and absolute http:// requests are proxied (this client sent an https:// URL without CONNECT; use curl or GNU wget)\n",
-        )
-        .await;
-        return None;
+        let why = if head.target.starts_with("https://") {
+            "pocket proxy: this client sent an https:// URL without CONNECT; use curl or GNU wget\n"
+        } else {
+            "pocket proxy: only CONNECT and absolute http:// requests are proxied\n"
+        };
+        respond(guest, 400, "Bad Request", why).await;
+        return (None, false);
     };
     let (authority, path) = match rest.find(['/', '?']) {
         Some(i) => (&rest[..i], &rest[i..]),
@@ -446,7 +664,7 @@ where
             "pocket proxy: credentials in URLs are not proxied\n",
         )
         .await;
-        return None;
+        return (None, false);
     }
     let Some((host, port)) = split_authority(authority, Some(80)) else {
         respond(
@@ -456,21 +674,22 @@ where
             "pocket proxy: bad request target\n",
         )
         .await;
-        return None;
+        return (None, false);
     };
     let mut o = Outcome::new(&ctx.pocket, "http", &host, port);
     o.entry.method = Some(head.method.clone());
     o.entry.path = Some(path.chars().take(512).collect());
+    let deny = |o: &mut Outcome, why: String| {
+        o.entry.reason = why;
+    };
     // A Host header naming something else would let an allowed target route elsewhere.
-    if let Some((_, h)) = head
-        .headers
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("host"))
-    {
+    if let Some(h) = header(&head.headers, "host") {
         let matches = split_authority(h, Some(80)).is_some_and(|(hh, hp)| hh == host && hp == port);
         if !matches {
-            o.entry.reason =
-                format!("Host header {h:?} does not match request target {host}:{port}");
+            deny(
+                &mut o,
+                format!("Host header {h:?} does not match request target {host}:{port}"),
+            );
             respond(
                 guest,
                 403,
@@ -478,12 +697,19 @@ where
                 &format!("blocked by pocket: {}\n", o.entry.reason),
             )
             .await;
-            return Some(o);
+            return (Some(o), false);
         }
     }
+    let req_body = match body_framing(&head.headers, true) {
+        Ok(f) => f,
+        Err(e) => {
+            respond(guest, 400, "Bad Request", &format!("pocket proxy: {e}\n")).await;
+            return (None, false);
+        }
+    };
     let decision = ctx.policy.read().unwrap().decide(&host, port);
     if let Err(why) = decision {
-        o.entry.reason = why.clone();
+        deny(&mut o, why.clone());
         respond(
             guest,
             403,
@@ -491,28 +717,48 @@ where
             &format!("blocked by pocket: {why}\n"),
         )
         .await;
-        return Some(o);
+        return (Some(o), false);
     }
-    let mut up = match connect_checked(ctx, &host, port, &mut o).await {
-        Ok(s) => s,
-        Err(why) => {
-            o.entry.reason = why.clone();
-            let code = if why.contains("always denied") {
-                403
-            } else {
-                502
-            };
-            respond(
-                guest,
-                code,
-                "Blocked",
-                &format!("blocked by pocket: {why}\n"),
-            )
-            .await;
-            return Some(o);
+    if up
+        .as_ref()
+        .is_some_and(|u| u.host != host || u.port != port)
+    {
+        *up = None;
+    }
+    if up.is_none() {
+        match connect_checked(ctx, &host, port, &mut o).await {
+            Ok(io) => {
+                *up = Some(UpstreamConn {
+                    host: host.clone(),
+                    port,
+                    io,
+                    buf: vec![],
+                })
+            }
+            Err(why) => {
+                let code = if why.contains("always denied") {
+                    403
+                } else {
+                    502
+                };
+                deny(&mut o, why.clone());
+                respond(
+                    guest,
+                    code,
+                    "Blocked",
+                    &format!("blocked by pocket: {why}\n"),
+                )
+                .await;
+                return (Some(o), false);
+            }
         }
-    };
-    let mut req = format!("{} {path} {}\r\n", head.method, head.version);
+    }
+    let u = up.as_mut().unwrap();
+    let upgrade = header(&head.headers, "upgrade").map(String::from);
+    let client_close = has_token(&head.headers, "connection", "close")
+        || (head.version == "HTTP/1.0" && !has_token(&head.headers, "connection", "keep-alive"));
+    let is_head = head.method == "HEAD";
+    let mut req = format!("{} {path} HTTP/1.1\r\n", head.method);
     let mut has_host = false;
     for (k, v) in &head.headers {
         let lk = k.to_ascii_lowercase();
@@ -525,36 +771,108 @@ where
     if !has_host {
         req.push_str(&format!("Host: {authority}\r\n"));
     }
-    // One request per connection keeps the proxy from having to parse message bodies.
-    req.push_str("Connection: close\r\n\r\n");
-    if up.write_all(req.as_bytes()).await.is_err() || up.write_all(&head.rest).await.is_err() {
-        return None;
+    match &upgrade {
+        Some(proto) => req.push_str(&format!("Connection: Upgrade\r\nUpgrade: {proto}\r\n\r\n")),
+        None if client_close => req.push_str("Connection: close\r\n\r\n"),
+        None => req.push_str("\r\n"),
     }
-    let mut first = vec![0u8; 16 * 1024];
-    let n = match tokio::time::timeout(Duration::from_secs(60), up.read(&mut first)).await {
-        Ok(Ok(n)) if n > 0 => n,
-        _ => {
-            o.entry.reason = "upstream closed without a response".into();
-            respond(guest, 502, "Bad Gateway", "pocket proxy: upstream closed\n").await;
-            return Some(o);
+    if has_token(&head.headers, "expect", "100-continue")
+        && guest
+            .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
+            .await
+            .is_err()
+    {
+        return (None, false);
+    }
+    let mut gsrc = Src {
+        r: &mut *guest,
+        buf: head.rest,
+    };
+    let sent = async {
+        u.io.write_all(req.as_bytes()).await?;
+        let body = match req_body {
+            Framing::Length(n) => gsrc.copy_n(n, &mut u.io).await?,
+            Framing::Chunked => gsrc.copy_chunked(&mut u.io).await?,
+            _ => 0,
+        };
+        Ok::<u64, io::Error>(req.len() as u64 + body)
+    }
+    .await;
+    *leftover = std::mem::take(&mut gsrc.buf);
+    let Ok(sent) = sent else {
+        *up = None;
+        return (None, false);
+    };
+    o.entry.bytes_up = sent;
+    let mut usrc = Src {
+        r: &mut u.io,
+        buf: std::mem::take(&mut u.buf),
+    };
+    let resp = loop {
+        match tokio::time::timeout(IDLE, read_resp_head(&mut usrc)).await {
+            Ok(Ok(r)) if (100..200).contains(&r.status) && r.status != 101 => continue,
+            Ok(Ok(r)) => break r,
+            _ => {
+                o.entry.reason = "upstream closed without a response".into();
+                respond(guest, 502, "Bad Gateway", "pocket proxy: upstream closed\n").await;
+                *up = None;
+                return (Some(o), false);
+            }
         }
     };
-    first.truncate(n);
-    o.entry.status = std::str::from_utf8(&first[..n.min(32)])
-        .ok()
-        .and_then(|s| s.split(' ').nth(1))
-        .and_then(|c| c.parse().ok());
-    if guest.write_all(&first).await.is_err() {
-        return None;
-    }
+    o.entry.status = Some(resp.status);
     o.entry.verdict = Verdict::Allowed;
     o.entry.reason = "allowed".into();
-    let (a, b) = tokio::io::copy_bidirectional(guest, &mut up)
-        .await
-        .unwrap_or((0, 0));
-    o.entry.bytes_up = (req.len() + head.rest.len()) as u64 + a;
-    o.entry.bytes_down = n as u64 + b;
-    Some(o)
+    if guest.write_all(&resp.raw).await.is_err() {
+        *up = None;
+        return (Some(o), false);
+    }
+    let mut down = resp.raw.len() as u64;
+    if resp.status == 101 && upgrade.is_some() {
+        // Protocol switch (e.g. WebSocket): splice raw bytes until either side closes.
+        let pending = std::mem::take(&mut usrc.buf);
+        let _ = guest.write_all(&pending).await;
+        let mut io = up.take().unwrap().io;
+        if !leftover.is_empty() {
+            let _ = io.write_all(leftover).await;
+        }
+        let (a, b) = tokio::io::copy_bidirectional(guest, &mut io)
+            .await
+            .unwrap_or((0, 0));
+        o.entry.bytes_up += a;
+        o.entry.bytes_down = down + pending.len() as u64 + b;
+        return (Some(o), false);
+    }
+    let framing = if is_head || resp.status == 204 || resp.status == 304 {
+        Ok(Framing::Empty)
+    } else {
+        body_framing(&resp.headers, false)
+    };
+    let until_close = matches!(framing, Ok(Framing::UntilClose));
+    let copied = match framing {
+        Ok(Framing::Empty) => Ok(0),
+        Ok(Framing::Length(n)) => usrc.copy_n(n, guest).await,
+        Ok(Framing::Chunked) => usrc.copy_chunked(guest).await,
+        // The body ends at close: this connection cannot carry another response.
+        Ok(Framing::UntilClose) => usrc.copy_to_end(guest).await,
+        Err(e) => Err(e),
+    };
+    u.buf = std::mem::take(&mut usrc.buf);
+    match copied {
+        Ok(n) => down += n,
+        Err(_) => {
+            o.entry.bytes_down = down;
+            *up = None;
+            return (Some(o), false);
+        }
+    }
+    o.entry.bytes_down = down;
+    let upstream_close = until_close || has_token(&resp.headers, "connection", "close");
+    if upstream_close {
+        *up = None;
+    }
+    let _ = guest.flush().await;
+    (Some(o), !(client_close || until_close))
 }
 
 #[cfg(test)]
