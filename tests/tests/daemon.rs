@@ -305,3 +305,63 @@ fn errors_say_what_happened_and_how_to_fix_it() {
         }
     }
 }
+
+#[test]
+fn peer_credentials_are_checked() {
+    let Some(assets) = assets() else { return };
+    let mut env = Env::new("peercred", &assets);
+    env.extra
+        .push(("POCKETD_TEST_PEER_UID".into(), (uid() + 1).to_string()));
+    let o = env.pocket(&["ls"]);
+    assert_eq!(
+        o.status.code(),
+        Some(11),
+        "a client with another uid must be refused"
+    );
+    assert!(
+        env.log()
+            .contains(&format!("rejected connection from uid {}", uid()))
+    );
+}
+
+#[test]
+fn events_reach_subscribers_and_kill_ends_sessions() {
+    let Some(assets) = assets() else { return };
+    let env = Env::new("events", &assets);
+    let n = format!("ev-{}", std::process::id());
+    env.ok(&["new", &n, "--preset", "test", "--no-repo", "--detach"]);
+    let mut follow = env
+        .cmd("pocket")
+        .args(["--json", "logs", &n, "--net", "--follow"])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let _ = env.pocket(&[
+        "exec",
+        &n,
+        "--",
+        "wget",
+        "-q",
+        "-O-",
+        "http://blocked.example/",
+    ]);
+    let mut out = follow.stdout.take().unwrap();
+    let mut buf = vec![0u8; 4096];
+    let k = out.read(&mut buf).unwrap();
+    let line = String::from_utf8_lossy(&buf[..k]);
+    eprintln!("follow: {line}");
+    assert!(
+        line.contains("blocked.example") && line.contains("Denied"),
+        "{line}"
+    );
+    let _ = follow.kill();
+    let _ = follow.wait();
+
+    env.ok(&["kill", &format!("{n}:shell")]);
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let s = env.json(&["sessions", &n]);
+    assert_eq!(s[0]["exited"]["Signal"], libc::SIGHUP, "{s}");
+    env.ok(&["kill", &format!("{n}:shell")]);
+    assert!(env.json(&["sessions", &n]).as_array().unwrap().is_empty());
+}

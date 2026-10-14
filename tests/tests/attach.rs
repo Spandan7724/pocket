@@ -137,7 +137,10 @@ fn new_attach_type_detach_reattach_rm() {
     let list = env.ok(&["sessions", &name]);
     assert!(list.contains("shell-2"), "{list}");
     q.write(&[0x1d, b's']);
-    q.wait_screen(|s| s.contains("1  shell") && s.contains("2  shell-2") && s.contains("attached"), T);
+    q.wait_screen(
+        |s| s.contains("1  shell") && s.contains("2  shell-2") && s.contains("attached"),
+        T,
+    );
     q.write(b"1");
     std::thread::sleep(Duration::from_millis(500));
     let m = q.mark();

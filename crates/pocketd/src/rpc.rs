@@ -22,7 +22,11 @@ pub async fn serve(d: Arc<Daemon>, l: UnixListener, stop: Arc<tokio::sync::Notif
                 continue;
             }
         };
-        let uid = unsafe { libc::getuid() };
+        // POCKETD_TEST_PEER_UID exercises the rejection path in tests (no second user).
+        let uid = std::env::var("POCKETD_TEST_PEER_UID")
+            .ok()
+            .and_then(|u| u.parse().ok())
+            .unwrap_or_else(|| unsafe { libc::getuid() });
         match s.peer_cred() {
             Ok(c) if c.uid() == uid => {}
             Ok(c) => {
