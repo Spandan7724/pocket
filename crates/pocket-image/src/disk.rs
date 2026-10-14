@@ -107,6 +107,61 @@ fn sparse_copy(s: &File, d: &File, src: &Path, dst: &Path) -> Result<(), DiskErr
     d.sync_all().map_err(err("sync", dst))
 }
 
+/// Bytes actually allocated to a (sparse) file.
+pub fn allocated_bytes(p: &Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    fs::metadata(p).map(|m| m.blocks() * 512).unwrap_or(0)
+}
+
+/// Formatted, empty, sparse ext4 template for `size_bytes` disks, created once in
+/// `templates_dir` and then cloned for every pocket.
+pub fn empty_ext4_template(templates_dir: &Path, size_bytes: u64) -> Result<PathBuf, DiskError> {
+    let t = templates_dir.join(format!("empty-ext4-{}m.raw", size_bytes >> 20));
+    if t.exists() {
+        return Ok(t);
+    }
+    fs::create_dir_all(templates_dir).map_err(err("create", templates_dir))?;
+    let tmp = t.with_extension("tmp");
+    let _ = fs::remove_file(&tmp);
+    File::create(&tmp)
+        .and_then(|f| f.set_len(size_bytes))
+        .map_err(err("create", &tmp))?;
+    // Lazy init keeps the image sparse; the guest finishes inode table init in background.
+    let out = std::process::Command::new("mkfs.ext4")
+        .args([
+            "-q",
+            "-F",
+            "-m",
+            "0",
+            "-E",
+            "lazy_itable_init=1,lazy_journal_init=1",
+        ])
+        .args(["-L", "pocket", "-U", "clear"])
+        .arg(&tmp)
+        .output()
+        .map_err(err("run mkfs.ext4 for", &tmp))?;
+    if !out.status.success() {
+        let _ = fs::remove_file(&tmp);
+        return Err(DiskError {
+            op: "mkfs.ext4",
+            path: tmp,
+            source: io::Error::other(String::from_utf8_lossy(&out.stderr).into_owned()),
+        });
+    }
+    fs::rename(&tmp, &t).map_err(err("rename", &t))?;
+    Ok(t)
+}
+
+/// Creates the pocket disk at `dest`: a reflink (or sparse copy) of the empty template.
+pub fn create_pocket_disk(
+    templates_dir: &Path,
+    size_bytes: u64,
+    dest: &Path,
+) -> Result<CloneMode, DiskError> {
+    let t = empty_ext4_template(templates_dir, size_bytes)?;
+    clone_disk(&t, dest)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
