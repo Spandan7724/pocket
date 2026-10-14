@@ -169,6 +169,7 @@ impl TestVm {
             vsock_uds: dir.join("vsock.sock"),
             api_socket: dir.join("api.sock"),
             serial_log: o.serial.then(|| dir.join("serial.log")),
+            balloon: false,
         };
         let log = fs::File::create(dir.join("vmm.log")).unwrap();
         let started = Instant::now();

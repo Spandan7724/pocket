@@ -17,3 +17,4 @@ pocket-vmm = { path = "../crates/pocket-vmm" }
 
 [dev-dependencies]
 libc = "0.2"
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros"] }
