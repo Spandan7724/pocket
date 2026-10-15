@@ -90,6 +90,20 @@ fn claude_code_and_codex_start_in_their_presets() {
     ] {
         let n = format!("{preset}-{}", std::process::id());
         env.ok(&["new", &n, "--preset", preset, "--no-repo", "--detach"]);
+        assert!(
+            env.ok(&["exec", &n, "--", "gh", "--version"])
+                .starts_with("gh version")
+        );
+        if bin == "claude" {
+            let m = env.ok(&[
+                "exec",
+                &n,
+                "--",
+                "cat",
+                "/etc/claude-code/managed-settings.json",
+            ]);
+            assert!(m.contains("\"DISABLE_AUTOUPDATER\": \"1\""), "{m}");
+        }
         let v = env.ok(&["exec", &n, "--", bin, "--version"]);
         eprintln!("{bin} --version: {v}");
         assert!(!v.trim().is_empty());

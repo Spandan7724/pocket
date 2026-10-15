@@ -12,7 +12,7 @@ apt-get install -y --no-install-recommends \
     ca-certificates curl wget git sudo less vim htop tmux ncurses-term locales \
     build-essential pkg-config python3 python3-pip python3-venv nodejs npm cargo \
     procps psmisc iproute2 openssh-client unzip zip xz-utils jq ripgrep file \
-    bash-completion man-db
+    bash-completion man-db gh
 userdel -r ubuntu 2>/dev/null || true
 useradd -m -u 1000 -s /bin/bash -G sudo dev
 echo 'dev ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/90-dev
@@ -21,4 +21,4 @@ chmod 0440 /etc/sudoers.d/90-dev /etc/sudoers.d/91-pocket
 mkdir -p /work
 apt-get clean
 rm -rf /var/lib/apt/lists/* /var/cache/apt/*.bin /root/.cache /root/.npm
-git --version; node --version; python3 --version; cargo --version
+git --version; gh --version | head -1; node --version; python3 --version; cargo --version

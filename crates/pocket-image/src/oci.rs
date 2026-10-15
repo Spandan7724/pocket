@@ -12,6 +12,14 @@ use sha2::{Digest, Sha256};
 use crate::layers;
 
 const MAX_MANIFEST: u64 = 4 << 20;
+const MAX_RETRIES: u32 = 5;
+
+/// Backoff for rate-limited or unavailable registries: `Retry-After` when given, else
+/// 1, 2, 4, 8, 16 s; capped at 30 s.
+fn retry_delay(attempt: u32, retry_after_secs: Option<u64>) -> Duration {
+    let secs = retry_after_secs.unwrap_or(1 << attempt.min(4));
+    Duration::from_secs(secs.min(30))
+}
 const MANIFEST_TYPES: &str = "application/vnd.oci.image.index.v1+json, \
     application/vnd.docker.distribution.manifest.list.v2+json, \
     application/vnd.oci.image.manifest.v1+json, \
@@ -244,7 +252,9 @@ impl Registry {
         url: &str,
         accept: Option<&str>,
     ) -> Result<ureq::http::Response<ureq::Body>, ImageError> {
-        for attempt in 0..2 {
+        let mut authed = false;
+        let mut retries = 0;
+        loop {
             let mut req = self.agent.get(url);
             if let Some(a) = accept {
                 req = req.header("Accept", a);
@@ -253,9 +263,11 @@ impl Registry {
                 req = req.header("Authorization", format!("Bearer {t}"));
             }
             let resp = req.call().map_err(|e| http(url, e))?;
-            match resp.status().as_u16() {
+            let status = resp.status().as_u16();
+            match status {
                 200 => return Ok(resp),
-                401 if attempt == 0 => {
+                401 if !authed => {
+                    authed = true;
                     let ch = resp
                         .headers()
                         .get("www-authenticate")
@@ -264,10 +276,19 @@ impl Registry {
                         .to_string();
                     self.authenticate(&ch)?;
                 }
+                // Registries rate-limit anonymous pulls, shared CI egress IPs especially.
+                429 | 502 | 503 | 504 if retries < MAX_RETRIES => {
+                    let after = resp
+                        .headers()
+                        .get("retry-after")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.trim().parse::<u64>().ok());
+                    std::thread::sleep(retry_delay(retries, after));
+                    retries += 1;
+                }
                 s => return Err(http(url, format!("HTTP {s}"))),
             }
         }
-        Err(http(url, "unauthorized"))
     }
 
     fn manifest(
@@ -516,6 +537,14 @@ pub fn pad_2m(p: &Path) -> Result<(), ImageError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retry_backoff() {
+        let d: Vec<u64> = (0..6).map(|a| retry_delay(a, None).as_secs()).collect();
+        assert_eq!(d, [1, 2, 4, 8, 16, 16]);
+        assert_eq!(retry_delay(0, Some(7)).as_secs(), 7);
+        assert_eq!(retry_delay(0, Some(3600)).as_secs(), 30);
+    }
 
     #[test]
     fn references() {

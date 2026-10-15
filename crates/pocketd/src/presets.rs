@@ -173,10 +173,24 @@ pub async fn pull(
         Parent::Preset(parent) => Box::pin(pull(d, parent, progress)).await?,
     };
     let k = key(p);
-    let out = d
-        .paths
-        .images()
-        .join(format!("preset-{name}-{}.erofs", &k[..16]));
+    // With a preset cache the image is built straight into it: one copy, not two.
+    let out = match cache_path(name, &k) {
+        Some(c) => {
+            if let Some(dir) = c.parent() {
+                std::fs::create_dir_all(dir).map_err(|e| {
+                    err(
+                        ErrorCode::HostSetup,
+                        format!("create {}: {e}", dir.display()),
+                    )
+                })?;
+            }
+            c
+        }
+        None => d
+            .paths
+            .images()
+            .join(format!("preset-{name}-{}.erofs", &k[..16])),
+    };
     build(d, p, &parent, &out, progress).await?;
     let size = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
     let digest = format!("sha256:{k}");
@@ -190,16 +204,6 @@ pub async fn pull(
             size_bytes: size,
         })
     })?;
-    if let Some(c) = cache_path(name, &k) {
-        if let Some(dir) = c.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        if !c.exists()
-            && let Err(e) = pocket_image::disk::clone_disk(&out, &c)
-        {
-            tracing::warn!("copy {name} to the preset cache {}: {e}", c.display());
-        }
-    }
     progress(&format!(
         "{name}: built ({:.0} MiB)",
         size as f64 / 1048576.0
