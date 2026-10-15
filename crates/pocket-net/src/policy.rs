@@ -237,12 +237,18 @@ pub struct Policy {
 
 pub const PROFILES: &[&str] = &["dev", "strict", "offline"];
 
-/// Destinations every agent preset needs; `dev` adds package registries.
+/// Destinations agent CLIs need. Claude Code's list follows
+/// https://code.claude.com/docs/en/network-config ("Network access requirements"); its
+/// optional Datadog telemetry hosts are left out (blocked and logged like anything else).
 const AGENT_APIS: &[&str] = &[
     "api.anthropic.com",
-    "statsig.anthropic.com",
     "claude.ai",
-    "console.anthropic.com",
+    "claude.com",
+    "platform.claude.com",
+    "mcp-proxy.anthropic.com",
+    "downloads.claude.ai",
+    "code.claude.com",
+    "raw.githubusercontent.com",
     "api.openai.com",
     "auth.openai.com",
     "chatgpt.com",
@@ -426,8 +432,26 @@ mod tests {
         assert!(dev.decide("registry.npmjs.org", 443).is_ok());
         assert!(dev.decide("api.anthropic.com", 443).is_ok());
         assert!(dev.decide("example.com", 443).is_err());
+        for host in [
+            "api.anthropic.com",
+            "claude.ai",
+            "claude.com",
+            "platform.claude.com",
+            "mcp-proxy.anthropic.com",
+            "downloads.claude.ai",
+        ] {
+            assert!(
+                dev.decide(host, 443).is_ok(),
+                "{host} (Claude Code login and API)"
+            );
+        }
+        assert!(
+            dev.decide("http-intake.logs.us5.datadoghq.com", 443)
+                .is_err()
+        );
         let strict = Policy::profile("strict").unwrap();
         assert!(strict.decide("api.anthropic.com", 443).is_ok());
+        assert!(strict.decide("platform.claude.com", 443).is_ok());
         assert!(strict.decide("registry.npmjs.org", 443).is_err());
         let off = Policy::profile("offline").unwrap();
         assert!(off.decide("api.anthropic.com", 443).is_err());
