@@ -17,34 +17,20 @@ use crate::guest::ExecReq;
 /// Bump to rebuild every preset (e.g. when the export format changes).
 const FORMAT: &str = "1";
 
-enum Parent {
-    Oci(&'static str),
-    Preset(&'static str),
-}
-
 struct Preset {
     name: &'static str,
-    parent: Parent,
+    /// OCI image the build script runs on.
+    parent: &'static str,
     script: &'static str,
 }
 
-const PRESETS: &[Preset] = &[
-    Preset {
-        name: "base",
-        parent: Parent::Oci("docker.io/library/ubuntu:24.04"),
-        script: include_str!("../../../guest/presets/base.sh"),
-    },
-    Preset {
-        name: "claude",
-        parent: Parent::Preset("base"),
-        script: include_str!("../../../guest/presets/claude.sh"),
-    },
-    Preset {
-        name: "codex",
-        parent: Parent::Preset("base"),
-        script: include_str!("../../../guest/presets/codex.sh"),
-    },
-];
+/// One built-in image with every major toolchain and agent (D19); `--preset` stays for
+/// custom and project images later.
+const PRESETS: &[Preset] = &[Preset {
+    name: "base",
+    parent: "docker.io/library/ubuntu:24.04",
+    script: include_str!("../../../guest/presets/base.sh"),
+}];
 
 /// Minimal Alpine image from the assets dir, for tests (no git, root only).
 pub const TEST_PRESET: &str = "test";
@@ -69,10 +55,7 @@ fn key(p: &Preset) -> String {
     h.update([0]);
     h.update(p.script);
     h.update([0]);
-    match p.parent {
-        Parent::Oci(r) => h.update(r),
-        Parent::Preset(parent) => h.update(key(find(parent).unwrap())),
-    }
+    h.update(p.parent);
     hex(&h.finalize())
 }
 
@@ -143,34 +126,32 @@ pub async fn pull(
         err(ErrorCode::BadRequest, format!("unknown preset {name:?}"))
             .hint(format!("available presets: {}", names().join(", ")))
     })?;
-    let parent = match p.parent {
-        Parent::Oci(r) => {
-            progress(&format!("pulling {r}"));
-            let store = ImageStore {
-                images_dir: d.paths.images(),
-                blobs_dir: d.paths.blobs(),
-                mkfs_erofs: d.paths.tool("mkfs.erofs"),
-            };
-            let r = r.to_string();
-            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-            let job = tokio::task::spawn_blocking(move || {
-                store.pull(&r, &|s| {
-                    let _ = tx.send(s.to_string());
-                })
-            });
-            while let Some(s) = rx.recv().await {
-                progress(&s);
-            }
-            let img = job
-                .await
-                .map_err(|e| err(ErrorCode::Internal, e.to_string()))?
-                .map_err(|e| err(ErrorCode::Image, e.to_string()))?;
-            Image {
-                path: img.path,
-                digest: img.digest,
-            }
+    let parent = {
+        let r = p.parent;
+        progress(&format!("pulling {r}"));
+        let store = ImageStore {
+            images_dir: d.paths.images(),
+            blobs_dir: d.paths.blobs(),
+            mkfs_erofs: d.paths.tool("mkfs.erofs"),
+        };
+        let r = r.to_string();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let job = tokio::task::spawn_blocking(move || {
+            store.pull(&r, &|s| {
+                let _ = tx.send(s.to_string());
+            })
+        });
+        while let Some(s) = rx.recv().await {
+            progress(&s);
         }
-        Parent::Preset(parent) => Box::pin(pull(d, parent, progress)).await?,
+        let img = job
+            .await
+            .map_err(|e| err(ErrorCode::Internal, e.to_string()))?
+            .map_err(|e| err(ErrorCode::Image, e.to_string()))?;
+        Image {
+            path: img.path,
+            digest: img.digest,
+        }
     };
     let k = key(p);
     // With a preset cache the image is built straight into it: one copy, not two.

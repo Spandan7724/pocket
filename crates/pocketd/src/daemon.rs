@@ -968,6 +968,11 @@ pub fn proxy_env() -> Vec<(String, String)> {
         v.push((k.to_string(), "localhost,127.0.0.1,::1".to_string()));
     }
     v.push(("NODE_USE_ENV_PROXY".into(), "1".into()));
+    // Node 22 warns on every start that the env-proxy agent is experimental.
+    v.push((
+        "NODE_OPTIONS".into(),
+        "--disable-warning=UNDICI-EHPA".into(),
+    ));
     v.push(("POCKET".into(), "1".into()));
     v
 }

@@ -237,10 +237,13 @@ pub struct Policy {
 
 pub const PROFILES: &[&str] = &["dev", "strict", "offline"];
 
-/// Destinations agent CLIs need. Claude Code's list follows
-/// https://code.claude.com/docs/en/network-config ("Network access requirements"); its
-/// optional Datadog telemetry hosts are left out (blocked and logged like anything else).
+/// Destinations the agents in the `base` image need: their own services and the model
+/// providers they can be pointed at. Sources: Claude Code
+/// https://code.claude.com/docs/en/network-config (its optional Datadog telemetry is left
+/// out), GitHub Copilot's allowlist reference, Cursor's network configuration page, and the
+/// Gemini CLI source.
 const AGENT_APIS: &[&str] = &[
+    // Anthropic / Claude Code
     "api.anthropic.com",
     "claude.ai",
     "claude.com",
@@ -249,9 +252,50 @@ const AGENT_APIS: &[&str] = &[
     "downloads.claude.ai",
     "code.claude.com",
     "raw.githubusercontent.com",
+    // OpenAI / Codex
     "api.openai.com",
     "auth.openai.com",
     "chatgpt.com",
+    // Google / Gemini CLI
+    "generativelanguage.googleapis.com",
+    "cloudcode-pa.googleapis.com",
+    "oauth2.googleapis.com",
+    "www.googleapis.com",
+    "accounts.google.com",
+    "codeassist.google.com",
+    // GitHub Copilot CLI
+    "api.github.com",
+    "*.githubcopilot.com",
+    "copilot-proxy.githubusercontent.com",
+    "default.exp-tas.com",
+    // Cursor CLI
+    "cursor.com",
+    "downloads.cursor.com",
+    "*.cursor.sh",
+    "*.cursor-cdn.com",
+    "*.cursorapi.com",
+    // Amp, OpenCode, Kilo
+    "ampcode.com",
+    "*.ampcode.com",
+    "opencode.ai",
+    "*.opencode.ai",
+    "models.dev",
+    "kilo.ai",
+    "*.kilo.ai",
+    "kilocode.ai",
+    "*.kilocode.ai",
+    // Model providers used by Pi, mu, Aider, Goose, Crush, Qwen Code
+    "openrouter.ai",
+    "api.x.ai",
+    "api.mistral.ai",
+    "api.groq.com",
+    "api.deepseek.com",
+    "api.moonshot.ai",
+    "*.kimi.com",
+    "api.z.ai",
+    "chat.qwen.ai",
+    "dashscope.aliyuncs.com",
+    "dashscope-intl.aliyuncs.com",
 ];
 
 const DEV_EXTRA: &[&str] = &[
@@ -259,6 +303,10 @@ const DEV_EXTRA: &[&str] = &[
     "*.github.com",
     "*.githubusercontent.com",
     "registry.npmjs.org",
+    "registry.yarnpkg.com",
+    "repo.yarnpkg.com",
+    "nodejs.org",
+    "bun.sh",
     "pypi.org",
     "files.pythonhosted.org",
     "crates.io",
@@ -267,6 +315,19 @@ const DEV_EXTRA: &[&str] = &[
     "static.rust-lang.org",
     "proxy.golang.org",
     "sum.golang.org",
+    "repo.maven.apache.org",
+    "repo1.maven.org",
+    "services.gradle.org",
+    "downloads.gradle.org",
+    "plugins.gradle.org",
+    "plugins-artifacts.gradle.org",
+    "rubygems.org",
+    "index.rubygems.org",
+    "packagist.org",
+    "repo.packagist.org",
+    "getcomposer.org",
+    "api.nuget.org",
+    "globalcdn.nuget.org",
     "deb.debian.org",
     "security.debian.org",
     "archive.ubuntu.com",

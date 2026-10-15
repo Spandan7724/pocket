@@ -176,9 +176,12 @@ pub fn kill(name: &str, signal: i32) -> Result<(), GuestError> {
         sessions().as_mut().map(|m| m.remove(name));
         return Ok(());
     }
-    // The session leader's pid is also its process group id.
-    sys::kill(-(s.pid as i32), signal)
-        .map_err(|e| GuestError::new(ErrorKind::Io, format!("kill: {e}")))
+    // The session leader's pid is also its process group id. ESRCH means the group exited
+    // after the check above; the caller wanted it gone, so that is success.
+    match sys::kill(-(s.pid as i32), signal) {
+        Err(e) if e.raw_os_error() == Some(libc::ESRCH) => Ok(()),
+        r => r.map_err(|e| GuestError::new(ErrorKind::Io, format!("kill: {e}"))),
+    }
 }
 
 struct Token {

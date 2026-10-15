@@ -15,8 +15,9 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # Kernel/VMM build trees live outside the repo so rust-cache never scans them.
-  POCKET_BUILD_DIR: ${{ github.workspace }}/../pocket-build
+  # Kernel/VMM build trees live outside the repo so rust-cache never scans them, on /mnt:
+  # building the base image needs ~25 GB of scratch, more than the root disk has free.
+  POCKET_BUILD_DIR: /mnt/pocket-build
 
 jobs:
   x86_64:
@@ -31,6 +32,12 @@ jobs:
           sudo apt-get update -q
           sudo apt-get install -q -y --no-install-recommends \
             erofs-utils e2fsprogs bc bison flex libelf-dev libssl-dev cpio
+
+      - name: Build directory on the large disk
+        run: |
+          sudo mkdir -p /mnt/pocket-build
+          sudo chown "$(id -u):$(id -g)" /mnt/pocket-build
+          df -h / /mnt
 
       - name: Grant /dev/kvm to the runner user
         run: |

@@ -100,7 +100,7 @@ fn inner() -> Result {
     Ok(())
 }
 
-pub const PRESETS: &[&str] = &["base", "claude", "codex"];
+pub const PRESETS: &[&str] = &["base"];
 
 /// Builds the CLI and daemon, then the preset images into `<out>/presets` (a cache hit
 /// when the preset scripts are unchanged). Expects isolated XDG dirs.
@@ -120,9 +120,15 @@ pub fn presets() -> Result {
         return Ok(());
     }
     let bin = root().join("target/debug");
+    // The builder pocket's disk and the exported root filesystem are several GB: keep them
+    // off a tmpfs /tmp. The runtime dir stays isolated (short UDS paths).
+    let data = out().join("preset-build");
+    let _ = fs::remove_dir_all(&data);
+    fs::create_dir_all(&data)?;
     let pocket = |args: &[&str]| {
         let mut c = Command::new(bin.join("pocket"));
         c.args(args)
+            .env("XDG_DATA_HOME", &data)
             .env("POCKET_ASSETS_DIR", out())
             .env("POCKET_PRESET_CACHE", out().join("presets"))
             .env("POCKETD", bin.join("pocketd"));

@@ -81,33 +81,99 @@ fn vim_and_htop_redraw_after_reattach() {
 }
 
 #[test]
-fn claude_code_and_codex_start_in_their_presets() {
+fn base_image_has_the_toolchains_and_agents() {
     let Some(a) = kvm_or_skip() else { return };
     let env = Env::new("agents", a.system.parent().unwrap());
-    for (preset, bin, needle) in [
-        ("claude", "claude", "Claude Code"),
-        ("codex", "codex", "codex"),
-    ] {
-        let n = format!("{preset}-{}", std::process::id());
-        env.ok(&["new", &n, "--preset", preset, "--no-repo", "--detach"]);
-        assert!(
-            env.ok(&["exec", &n, "--", "gh", "--version"])
-                .starts_with("gh version")
-        );
-        if bin == "claude" {
-            let m = env.ok(&[
-                "exec",
-                &n,
-                "--",
-                "cat",
-                "/etc/claude-code/managed-settings.json",
-            ]);
-            assert!(m.contains("\"DISABLE_AUTOUPDATER\": \"1\""), "{m}");
+    let n = format!("agents-{}", std::process::id());
+    env.ok(&["new", &n, "--preset", "base", "--no-repo", "--detach"]);
+    // Every toolchain and agent runs as the pocket user, through a login shell's PATH.
+    let mut tools = vec![
+        "gcc --version",
+        "g++ --version",
+        "clang --version",
+        "cmake --version",
+        "python3 --version",
+        "node --version",
+        "bun --version",
+        "tsc --version",
+        "rustc --version",
+        "cargo --version",
+        "go version",
+        "java -version",
+        "mvn --version",
+        "ruby --version",
+        "php --version",
+        "composer --version",
+        "dotnet --version",
+        "rg --version",
+        "gh --version",
+        "claude --version",
+        "codex --version",
+        "gemini --version",
+        "opencode --version",
+        "amp --version",
+        "copilot --version",
+        "qwen --version",
+        "crush --version",
+        "kilo --version",
+        "pi --version",
+        "cursor-agent --version",
+        "goose --version",
+        "aider --version",
+    ];
+    if std::env::consts::ARCH == "x86_64" {
+        tools.push("mu --version");
+    }
+    let mut missing = vec![];
+    for t in &tools {
+        let o = env.pocket(&[
+            "exec",
+            &n,
+            "--",
+            "bash",
+            "-lc",
+            &format!("{t} 2>&1 | head -1"),
+        ]);
+        let out = String::from_utf8_lossy(&o.stdout).trim().to_string();
+        eprintln!("{t:28} {out}");
+        if !o.status.success() || out.is_empty() || out.contains("command not found") {
+            missing.push(*t);
         }
-        let v = env.ok(&["exec", &n, "--", bin, "--version"]);
-        eprintln!("{bin} --version: {v}");
-        assert!(!v.trim().is_empty());
-        let mut p = attach(&env, &n, 30, 110);
+    }
+    assert!(missing.is_empty(), "not working: {missing:?}");
+    for (file, needle) in [
+        (
+            "/etc/claude-code/managed-settings.json",
+            "\"DISABLE_AUTOUPDATER\": \"1\"",
+        ),
+        (
+            "/etc/gemini-cli/settings.json",
+            "\"enableAutoUpdate\": false",
+        ),
+        ("/etc/opencode/opencode.json", "\"autoupdate\": false"),
+    ] {
+        assert!(
+            env.ok(&["exec", &n, "--", "cat", file]).contains(needle),
+            "{file}"
+        );
+    }
+    assert!(
+        env.ok(&["exec", &n, "--", "node", "--version"])
+            .starts_with("v22.")
+    );
+
+    let o = env.pocket(&["exec", &n, "--", "bash", "-lc", "node -e 'fetch' 2>&1"]);
+    assert!(
+        !String::from_utf8_lossy(&o.stdout).contains("EnvHttpProxyAgent"),
+        "Node's env-proxy warning should be silenced"
+    );
+
+    // Agent TUIs render over attach and repaint after reattaching at another size. Each runs
+    // in its own new session (`pocket sh`); `attach` then picks the most recent one.
+    for (bin, needle) in [("claude", "Claude Code"), ("codex", "codex")] {
+        let mut c = env.cmd("pocket");
+        c.args(["sh", &n]);
+        let mut p = Pty::spawn(c, 30, 110);
         p.wait_for("$ ", 0, T);
         p.write(format!("{bin}\r").as_bytes());
         let screen = p.wait_screen(
@@ -120,11 +186,9 @@ fn claude_code_and_codex_start_in_their_presets() {
         eprintln!("{bin} TUI at 30x110:\n{screen}");
         p.write(&[0x1d, b'd']);
         assert!(p.wait_exit(T).success());
-        // Reattach at another size: the agent TUI repaints for it.
         let q = attach(&env, &n, 40, 140);
         let again = q.wait_screen(|s| s.to_lowercase().contains(&needle.to_lowercase()), T);
         eprintln!("{bin} TUI after reattach at 40x140:\n{again}");
-        drop(q);
-        env.ok(&["rm", "-f", &n]);
     }
+    env.ok(&["rm", "-f", &n]);
 }
