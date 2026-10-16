@@ -143,12 +143,13 @@ fn sidekernel_checklist() {
         a.extend(["--", "bash", "-c", s]);
         env.pocket(&a)
     };
+    let outw = |s: &str| String::from_utf8_lossy(&shw(s).stdout).trim().to_string();
     let sh = |s: &str| env.pocket(&["exec", &n, "--", "bash", "-c", s]);
     let out = |s: &str| String::from_utf8_lossy(&sh(s).stdout).trim().to_string();
 
     // UB-1 T1: both directions, create/read/delete.
-    let t1 = out("cat /mnt/shared/from-host.txt") == "hello from the host"
-        && sh("echo from-guest > /mnt/shared/g.txt && rm /mnt/shared/from-host.txt")
+    let t1 = outw("cat /mnt/shared/from-host.txt") == "hello from the host"
+        && shw("echo from-guest > /mnt/shared/g.txt && rm /mnt/shared/from-host.txt")
             .status
             .success()
         && std::fs::read_to_string(share.join("g.txt")).is_ok_and(|t| t == "from-guest\n")
@@ -159,8 +160,8 @@ fn sidekernel_checklist() {
         "--share-dir (virtio-fs)".into(),
     ));
     // T2: permission bits.
-    let guest_mode = out("stat -c %a /mnt/shared/script.sh");
-    let ran = out("/mnt/shared/script.sh");
+    let guest_mode = outw("stat -c %a /mnt/shared/script.sh");
+    let ran = outw("/mnt/shared/script.sh");
     shw("echo x > /mnt/shared/p.txt && chmod 640 /mnt/shared/p.txt");
     let host_mode = std::fs::metadata(share.join("p.txt"))
         .map(|m| m.permissions().mode() & 0o777)
@@ -210,8 +211,8 @@ fn sidekernel_checklist() {
     ));
     // T8: symlinks.
     std::fs::write(share.join("from-host.txt"), "again\n").unwrap();
-    let t8 = out("cat /mnt/shared/link") == "again"
-        && out("readlink /mnt/shared/link") == "from-host.txt";
+    let t8 = outw("cat /mnt/shared/link") == "again"
+        && outw("readlink /mnt/shared/link") == "from-host.txt";
     card.push(("UB-1 T8 symlink in the shared folder", t8, String::new()));
     // T9: a 10 GiB file matches its host checksum.
     let started = Instant::now();
@@ -226,7 +227,7 @@ fn sidekernel_checklist() {
     .next()
     .unwrap()
     .to_string();
-    let guest_sum = out("sha256sum /mnt/big/ten.bin | cut -d' ' -f1");
+    let guest_sum = outw("sha256sum /mnt/big/ten.bin | cut -d' ' -f1");
     let t9 = host_sum == guest_sum;
     card.push((
         "UB-1 T9 10 GiB file checksum",
@@ -264,7 +265,7 @@ fn sidekernel_checklist() {
     let t5u = pip.status.success() && sh("~/venv/bin/python -c 'import six'").status.success();
     card.push(("UB-3 T5 pip packages survive a restart", t5u, String::new()));
     let t3u =
-        sh("claude --version").status.success() && out("cat /mnt/shared/g.txt") == "from-guest";
+        sh("claude --version").status.success() && outw("cat /mnt/shared/g.txt") == "from-guest";
     card.push((
         "UB-3 T3 Claude present after a restart (shares remounted)",
         t3u,
