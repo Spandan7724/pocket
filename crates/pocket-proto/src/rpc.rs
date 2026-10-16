@@ -12,10 +12,11 @@ use serde::{Deserialize, Serialize};
 use crate::guest::{ExitStatus, SessionInfo};
 
 /// Bump on every incompatible change to the types in this module.
-pub const RPC_VERSION: u32 = 1;
+pub const RPC_VERSION: u32 = 2;
 pub const MAX_RPC_FRAME: usize = 16 << 20;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[allow(clippy::large_enum_variant)]
 pub enum ClientMsg {
     Hello { proto_version: u32, client: String },
     Request { id: u64, req: Request },
@@ -64,6 +65,51 @@ pub struct NewPocket {
     /// Default session command; `None` = login shell.
     pub command: Option<Vec<String>>,
     pub term: Option<String>,
+    /// Secrets to inject as placeholders; `None` = every stored secret.
+    #[serde(default)]
+    pub secrets: Option<Vec<String>>,
+    /// Secrets whose real value is copied into the guest (explicit opt-in).
+    #[serde(default)]
+    pub copy_secrets: Vec<String>,
+    /// Copy host agent config (`~/.claude`, `~/.codex`) in, secrets stripped.
+    #[serde(default = "yes")]
+    pub sync_config: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+/// A stored credential (never its value).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecretInfo {
+    pub name: String,
+    /// `anthropic`, `openai`, `github` or `custom`.
+    pub provider: String,
+    /// `api_key`, `oauth_token`, `chatgpt` (Codex ChatGPT login) or `token`.
+    pub kind: String,
+    /// Destinations the value is injected for (`host` or `*.domain`).
+    pub hosts: Vec<String>,
+    /// Guest environment variables that hold the placeholder.
+    pub env: Vec<String>,
+    /// `Header: template` with `{}` for the value, added when the guest sends none.
+    pub header: Option<String>,
+    /// `keyring` (Secret Service) or `file` (encrypted file).
+    pub storage: String,
+    pub created_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecretAdd {
+    pub name: String,
+    /// `None` = guessed from the value.
+    pub provider: Option<String>,
+    pub kind: Option<String>,
+    pub value: String,
+    /// Empty = the provider's default destinations.
+    pub hosts: Vec<String>,
+    pub env: Vec<String>,
+    pub header: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -116,6 +162,18 @@ pub enum Request {
     Pull {
         preset: String,
     },
+    SecretAdd(SecretAdd),
+    SecretList,
+    SecretRemove {
+        name: String,
+    },
+    /// Adds destinations / env vars / a header template to a secret.
+    SecretBind {
+        name: String,
+        hosts: Vec<String>,
+        env: Vec<String>,
+        header: Option<String>,
+    },
     Doctor,
     /// Stops the daemon (VMs keep running and are re-adopted on the next start).
     DaemonStop,
@@ -145,6 +203,8 @@ pub enum Response {
         digest: String,
     },
     Doctor(Vec<Check>),
+    Secret(SecretInfo),
+    Secrets(Vec<SecretInfo>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -212,6 +272,9 @@ pub struct NetEntry {
     pub bytes_down: u64,
     pub verdict: Verdict,
     pub reason: String,
+    /// A credential was substituted into this request.
+    #[serde(default)]
+    pub injected: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -373,6 +436,9 @@ mod tests {
                     allow: vec!["x.com".into()],
                     command: None,
                     term: Some("xterm".into()),
+                    secrets: None,
+                    copy_secrets: vec![],
+                    sync_config: true,
                 }),
             },
             ClientMsg::Subscribe {

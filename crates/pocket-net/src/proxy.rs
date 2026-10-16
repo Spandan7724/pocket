@@ -67,6 +67,8 @@ pub struct ProxyCtx {
     pub resolver: Arc<dyn Resolver>,
     pub connector: Arc<dyn Connector>,
     pub log: Box<dyn Fn(NetEntry) + Send + Sync>,
+    /// TLS interception for the destinations its hooks claim; `None` = pass-through only.
+    pub mitm: Option<Arc<crate::mitm::Mitm>>,
 }
 
 fn now_ms() -> u64 {
@@ -76,20 +78,20 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-struct Head {
-    method: String,
-    target: String,
-    version: String,
-    headers: Vec<(String, String)>,
+pub(crate) struct Head {
+    pub(crate) method: String,
+    pub(crate) target: String,
+    pub(crate) version: String,
+    pub(crate) headers: Vec<(String, String)>,
     /// Bytes after the head (start of a body or of the tunnelled stream).
-    rest: Vec<u8>,
+    pub(crate) rest: Vec<u8>,
 }
 
 async fn read_head<S: AsyncRead + Unpin>(s: &mut S) -> io::Result<Option<Head>> {
     read_head_with(s, Vec::with_capacity(4096)).await
 }
 
-async fn read_head_with<S: AsyncRead + Unpin>(
+pub(crate) async fn read_head_with<S: AsyncRead + Unpin>(
     s: &mut S,
     mut buf: Vec<u8>,
 ) -> io::Result<Option<Head>> {
@@ -185,7 +187,7 @@ pub fn fuzz_parsers(data: &[u8]) {
 }
 
 /// `host:port` with optional `[v6]`; `default` when the port is absent.
-fn split_authority(a: &str, default: Option<u16>) -> Option<(String, u16)> {
+pub(crate) fn split_authority(a: &str, default: Option<u16>) -> Option<(String, u16)> {
     let (host, port) = if let Some(rest) = a.strip_prefix('[') {
         let (h, after) = rest.split_once(']')?;
         let port = match after.strip_prefix(':') {
@@ -207,7 +209,7 @@ fn split_authority(a: &str, default: Option<u16>) -> Option<(String, u16)> {
     Some((normalize_host(&host), port))
 }
 
-async fn respond<S: AsyncWrite + Unpin>(s: &mut S, code: u16, reason: &str, body: &str) {
+pub(crate) async fn respond<S: AsyncWrite + Unpin>(s: &mut S, code: u16, reason: &str, body: &str) {
     let msg = format!(
         "HTTP/1.1 {code} {reason}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\nX-Pocket-Blocked: 1\r\n\r\n{body}",
         body.len()
@@ -216,12 +218,12 @@ async fn respond<S: AsyncWrite + Unpin>(s: &mut S, code: u16, reason: &str, body
     let _ = s.shutdown().await;
 }
 
-struct Outcome {
-    entry: NetEntry,
+pub(crate) struct Outcome {
+    pub(crate) entry: NetEntry,
 }
 
 impl Outcome {
-    fn new(pocket: &str, kind: &str, host: &str, port: u16) -> Outcome {
+    pub(crate) fn new(pocket: &str, kind: &str, host: &str, port: u16) -> Outcome {
         Outcome {
             entry: NetEntry {
                 pocket: pocket.into(),
@@ -237,13 +239,14 @@ impl Outcome {
                 bytes_down: 0,
                 verdict: Verdict::Denied,
                 reason: String::new(),
+                injected: false,
             },
         }
     }
 }
 
 /// Resolves and checks every address; returns the connected upstream.
-async fn connect_checked(
+pub(crate) async fn connect_checked(
     ctx: &ProxyCtx,
     host: &str,
     port: u16,
@@ -354,6 +357,11 @@ where
         .await;
         return Some(o);
     }
+    if let Some(m) = &ctx.mitm
+        && m.hooks.intercepts(&host, port)
+    {
+        return crate::mitm::serve(guest, head, &host, port, ctx, m, o).await;
+    }
     let mut up = match connect_checked(ctx, &host, port, &mut o).await {
         Ok(s) => s,
         Err(why) => {
@@ -413,7 +421,7 @@ where
     Some(o)
 }
 
-const HOP_BY_HOP: &[&str] = &[
+pub(crate) const HOP_BY_HOP: &[&str] = &[
     "connection",
     "proxy-connection",
     "keep-alive",
@@ -423,28 +431,28 @@ const HOP_BY_HOP: &[&str] = &[
     "te",
     "expect",
 ];
-const IDLE: Duration = Duration::from_secs(60);
+pub(crate) const IDLE: Duration = Duration::from_secs(60);
 const MAX_LINE: usize = 8 * 1024;
 
-fn bad_data(msg: &'static str) -> io::Error {
+pub(crate) fn bad_data(msg: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg)
 }
 
 /// A reader with bytes already pulled off the socket in front of it.
-struct Src<'a, R> {
-    r: &'a mut R,
-    buf: Vec<u8>,
+pub(crate) struct Src<'a, R> {
+    pub(crate) r: &'a mut R,
+    pub(crate) buf: Vec<u8>,
 }
 
 impl<R: AsyncRead + Unpin> Src<'_, R> {
-    async fn fill(&mut self) -> io::Result<bool> {
+    pub(crate) async fn fill(&mut self) -> io::Result<bool> {
         let mut chunk = [0u8; 16 * 1024];
         let n = self.r.read(&mut chunk).await?;
         self.buf.extend_from_slice(&chunk[..n]);
         Ok(n > 0)
     }
 
-    async fn line(&mut self) -> io::Result<Vec<u8>> {
+    pub(crate) async fn line(&mut self) -> io::Result<Vec<u8>> {
         loop {
             if let Some(i) = self.buf.windows(2).position(|w| w == b"\r\n") {
                 let l = self.buf[..i + 2].to_vec();
@@ -460,7 +468,11 @@ impl<R: AsyncRead + Unpin> Src<'_, R> {
         }
     }
 
-    async fn copy_n<W: AsyncWrite + Unpin>(&mut self, mut n: u64, w: &mut W) -> io::Result<u64> {
+    pub(crate) async fn copy_n<W: AsyncWrite + Unpin>(
+        &mut self,
+        mut n: u64,
+        w: &mut W,
+    ) -> io::Result<u64> {
         let total = n;
         while n > 0 {
             if self.buf.is_empty() && !self.fill().await? {
@@ -474,7 +486,10 @@ impl<R: AsyncRead + Unpin> Src<'_, R> {
         Ok(total)
     }
 
-    async fn copy_chunked<W: AsyncWrite + Unpin>(&mut self, w: &mut W) -> io::Result<u64> {
+    pub(crate) async fn copy_chunked<W: AsyncWrite + Unpin>(
+        &mut self,
+        w: &mut W,
+    ) -> io::Result<u64> {
         let mut total = 0;
         loop {
             let l = self.line().await?;
@@ -497,7 +512,10 @@ impl<R: AsyncRead + Unpin> Src<'_, R> {
         }
     }
 
-    async fn copy_to_end<W: AsyncWrite + Unpin>(&mut self, w: &mut W) -> io::Result<u64> {
+    pub(crate) async fn copy_to_end<W: AsyncWrite + Unpin>(
+        &mut self,
+        w: &mut W,
+    ) -> io::Result<u64> {
         let mut total = self.buf.len() as u64;
         w.write_all(&self.buf).await?;
         self.buf.clear();
@@ -507,26 +525,26 @@ impl<R: AsyncRead + Unpin> Src<'_, R> {
 }
 
 #[derive(Debug, PartialEq)]
-enum Framing {
+pub(crate) enum Framing {
     Empty,
     Length(u64),
     Chunked,
     UntilClose,
 }
 
-fn header<'a>(h: &'a [(String, String)], name: &str) -> Option<&'a str> {
+pub(crate) fn header<'a>(h: &'a [(String, String)], name: &str) -> Option<&'a str> {
     h.iter()
         .find(|(k, _)| k.eq_ignore_ascii_case(name))
         .map(|(_, v)| v.as_str())
 }
 
-fn has_token(h: &[(String, String)], name: &str, token: &str) -> bool {
+pub(crate) fn has_token(h: &[(String, String)], name: &str, token: &str) -> bool {
     h.iter()
         .filter(|(k, _)| k.eq_ignore_ascii_case(name))
         .any(|(_, v)| v.split(',').any(|t| t.trim().eq_ignore_ascii_case(token)))
 }
 
-fn body_framing(h: &[(String, String)], request: bool) -> io::Result<Framing> {
+pub(crate) fn body_framing(h: &[(String, String)], request: bool) -> io::Result<Framing> {
     if has_token(h, "transfer-encoding", "chunked") {
         return Ok(Framing::Chunked);
     }
@@ -550,13 +568,15 @@ fn body_framing(h: &[(String, String)], request: bool) -> io::Result<Framing> {
     }
 }
 
-struct RespHead {
-    raw: Vec<u8>,
-    status: u16,
-    headers: Vec<(String, String)>,
+pub(crate) struct RespHead {
+    pub(crate) raw: Vec<u8>,
+    pub(crate) status: u16,
+    pub(crate) headers: Vec<(String, String)>,
 }
 
-async fn read_resp_head<R: AsyncRead + Unpin>(src: &mut Src<'_, R>) -> io::Result<RespHead> {
+pub(crate) async fn read_resp_head<R: AsyncRead + Unpin>(
+    src: &mut Src<'_, R>,
+) -> io::Result<RespHead> {
     let mut raw = vec![];
     loop {
         let l = src.line().await?;

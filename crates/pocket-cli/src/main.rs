@@ -5,6 +5,7 @@ mod attach;
 mod client;
 mod error;
 mod exec;
+mod secrets;
 mod term;
 mod vsock;
 
@@ -66,6 +67,18 @@ enum Cmd {
         /// Create without attaching.
         #[arg(long, short)]
         detach: bool,
+        /// Inject only these secrets (repeatable; default: every stored secret).
+        #[arg(long = "secret")]
+        secrets: Vec<String>,
+        /// Inject no secrets.
+        #[arg(long, conflicts_with = "secrets")]
+        no_secrets: bool,
+        /// Copy this secret's REAL value into the pocket instead of a placeholder.
+        #[arg(long = "copy-secret")]
+        copy_secrets: Vec<String>,
+        /// Don't copy host agent config (~/.claude, ~/.codex) into the pocket.
+        #[arg(long)]
+        no_config: bool,
         /// Command for the default session instead of a login shell.
         #[arg(last = true)]
         command: Vec<String>,
@@ -123,6 +136,24 @@ enum Cmd {
     },
     /// Build or fetch a preset image (base, claude, codex).
     Pull { preset: String },
+    /// Store a provider credential host-side: claude, openai or github.
+    Login {
+        provider: String,
+        /// Secret name (default: the provider).
+        #[arg(long)]
+        name: Option<String>,
+        /// openai: use the host's Codex login (~/.codex/auth.json).
+        #[arg(long)]
+        from_codex: bool,
+        /// github: use `gh auth token`.
+        #[arg(long)]
+        from_gh: bool,
+    },
+    /// Manage stored secrets and their destination bindings.
+    Secrets {
+        #[command(subcommand)]
+        cmd: secrets::SecretsCmd,
+    },
     /// Check this host and suggest fixes.
     Doctor,
     /// Manage the daemon.
@@ -467,8 +498,18 @@ fn command(c: &mut Client, cmd: Cmd, j: bool) -> Result<u8> {
             net,
             allow,
             detach,
+            secrets,
+            no_secrets,
+            copy_secrets,
+            no_config,
             command,
         } => {
+            if !copy_secrets.is_empty() {
+                eprintln!(
+                    "warning: --copy-secret puts the real value of {} inside the pocket, where any code can read and send it",
+                    copy_secrets.join(", ")
+                );
+            }
             let repo = if no_repo {
                 None
             } else if let Some(r) = repo {
@@ -497,6 +538,13 @@ fn command(c: &mut Client, cmd: Cmd, j: bool) -> Result<u8> {
                 allow,
                 command: (!command.is_empty()).then_some(command),
                 term: std::env::var("TERM").ok(),
+                secrets: if no_secrets {
+                    Some(vec![])
+                } else {
+                    (!secrets.is_empty()).then_some(secrets)
+                },
+                copy_secrets,
+                sync_config: !no_config,
             };
             let started = std::time::Instant::now();
             let r = c.request_with(Request::NewPocket(req), progress_printer(j));
@@ -744,6 +792,13 @@ fn command(c: &mut Client, cmd: Cmd, j: bool) -> Result<u8> {
             }
             Ok(0)
         }
+        Cmd::Login {
+            provider,
+            name,
+            from_codex,
+            from_gh,
+        } => secrets::login(c, &provider, name, from_codex, from_gh, j),
+        Cmd::Secrets { cmd } => secrets::secrets(c, cmd, j),
         Cmd::Doctor | Cmd::Daemon { .. } => unreachable!(),
     }
 }

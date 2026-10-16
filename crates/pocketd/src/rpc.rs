@@ -11,7 +11,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
 
 use crate::daemon::{Daemon, err};
-use crate::{doctor, presets};
+use crate::{doctor, presets, secrets};
 
 pub async fn serve(d: Arc<Daemon>, l: UnixListener, stop: Arc<tokio::sync::Notify>) {
     loop {
@@ -224,6 +224,23 @@ async fn handle(
                 digest: img.digest,
             }
         }
+        Request::SecretAdd(a) => Response::Secret(d.secret_add(a)?),
+        Request::SecretList => Response::Secrets(
+            d.db(|s| s.secrets())?
+                .iter()
+                .map(secrets::info_from_record)
+                .collect(),
+        ),
+        Request::SecretRemove { name } => {
+            d.secret_remove(&name)?;
+            Response::Done
+        }
+        Request::SecretBind {
+            name,
+            hosts,
+            env,
+            header,
+        } => Response::Secret(d.secret_bind(&name, &hosts, &env, &header)?),
         Request::Doctor => Response::Doctor(doctor::checks(d)),
         Request::DaemonStop => Response::Done,
     })

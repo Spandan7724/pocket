@@ -11,9 +11,14 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+base64 = "0.23"
 pocket-proto = { path = "../pocket-proto", features = ["rpc"] }
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 thiserror = "2"
 tokio = { version = "1.53", features = ["net", "io-util", "time", "rt", "macros"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+webpki-roots = "1"
 
 [dev-dependencies]
 tokio = { version = "1.53", features = ["net", "io-util", "time", "rt-multi-thread", "macros"] }

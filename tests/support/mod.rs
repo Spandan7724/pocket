@@ -5,6 +5,7 @@
 //! a failure.
 
 pub mod cli;
+pub mod fake;
 pub mod guest;
 pub mod pty;
 

@@ -18,8 +18,9 @@ use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
 use crate::guest::{ExecReq, GuestConn};
+use crate::inject::{InjectedSecret, PocketHooks};
 use crate::paths::Paths;
-use crate::{net, presets, workspace};
+use crate::{inject, net, presets, provision, secrets, workspace};
 
 pub const BOOT_ARGS: &str = "root=/dev/vda ro rootfstype=erofs init=/pocket-init reboot=k \
     panic=-1 8250.nr_uarts=0 i8042.noaux i8042.nomux i8042.dumbkbd quiet rcupdate.rcu_expedited=1";
@@ -99,6 +100,9 @@ pub struct Live {
     pub vm: VmHandle,
     pub guest: Arc<GuestConn>,
     pub user: Option<String>,
+    #[expect(dead_code, reason = "network approvals (M8) edit the live policy")]
+    pub proxy: Arc<pocket_net::proxy::ProxyCtx>,
+    pub hooks: Arc<PocketHooks>,
     pub stopping: AtomicBool,
     pub tasks: Mutex<Vec<JoinHandle<()>>>,
 }
@@ -119,18 +123,29 @@ pub struct Daemon {
     op_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     pub events: broadcast::Sender<(u64, Event)>,
     seq: AtomicU64,
+    pub vault: secrets::Vault,
+    ca: Mutex<Option<Arc<pocket_net::ca::Ca>>>,
+    tls: std::sync::OnceLock<Arc<rustls::ClientConfig>>,
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Default)]
-struct Meta {
+#[derive(serde::Serialize, serde::Deserialize, Default, Clone)]
+pub struct Meta {
     #[serde(default)]
-    user: Option<String>,
+    pub user: Option<String>,
     #[serde(default)]
-    allow: Vec<String>,
+    pub allow: Vec<String>,
+    #[serde(default)]
+    pub secrets: Vec<InjectedSecret>,
+    /// Copy host agent config in on first boot.
+    #[serde(default)]
+    pub sync_config: bool,
+    #[serde(default)]
+    pub provisioned: bool,
 }
 
 impl Daemon {
     pub fn new(paths: Paths, store: Store, backend: Arc<dyn VmmBackend>) -> Arc<Daemon> {
+        let paths_data = paths.data.clone();
         Arc::new(Daemon {
             paths,
             store: Mutex::new(store),
@@ -139,7 +154,78 @@ impl Daemon {
             op_locks: Mutex::new(HashMap::new()),
             events: broadcast::channel(4096).0,
             seq: AtomicU64::new(1),
+            vault: secrets::Vault::new(secrets::choose_backend(&paths_data)),
+            ca: Mutex::new(None),
+            tls: std::sync::OnceLock::new(),
         })
+    }
+
+    pub fn ca(&self) -> R<Arc<pocket_net::ca::Ca>> {
+        let mut g = self.ca.lock().unwrap();
+        if let Some(c) = &*g {
+            return Ok(c.clone());
+        }
+        let dir = self.paths.data.join("ca");
+        let ca = Arc::new(pocket_net::ca::Ca::load_or_create(&dir).map_err(|e| {
+            err(
+                ErrorCode::HostSetup,
+                format!("pocket CA in {}: {e}", dir.display()),
+            )
+        })?);
+        *g = Some(ca.clone());
+        Ok(ca)
+    }
+
+    pub fn upstream_tls(&self) -> Arc<rustls::ClientConfig> {
+        self.tls
+            .get_or_init(|| pocket_net::tls::client_config(pocket_net::tls::upstream_roots()))
+            .clone()
+    }
+
+    pub fn meta(rec: &PocketRecord) -> Meta {
+        serde_json::from_str(&rec.meta_json).unwrap_or_default()
+    }
+
+    pub fn save_meta(&self, id: &str, meta: &Meta) -> R<()> {
+        let mj = serde_json::to_string(meta).unwrap();
+        self.db(|s| s.set_meta(id, &mj))
+    }
+
+    /// Persists a refreshed ChatGPT login and keeps the host's own Codex login in step when
+    /// it still holds the tokens pocket imported (refresh tokens rotate).
+    pub fn chatgpt_refreshed(&self, name: &str, old: &inject::ChatGpt, new: &inject::ChatGpt) {
+        if let Err(e) = self.vault.set(name, &new.to_json()) {
+            tracing::warn!("{name}: store refreshed login: {}", e.message);
+        }
+        let host = provision::home().join(".codex/auth.json");
+        if let Ok(text) = std::fs::read_to_string(&host)
+            && let Ok(cur) = inject::ChatGpt::parse(&text)
+            && cur.refresh_token == old.refresh_token
+        {
+            let mut upd = cur;
+            upd.id_token = new.id_token.clone();
+            upd.access_token = new.access_token.clone();
+            upd.refresh_token = new.refresh_token.clone();
+            if let Err(e) = provision::write_private(&host, upd.to_json().as_bytes()) {
+                tracing::warn!("{name}: update {}: {e}", host.display());
+            } else {
+                tracing::info!("{name}: refreshed login written back to {}", host.display());
+            }
+        }
+    }
+
+    pub fn update_injected(&self, pocket_id: &str, s: &InjectedSecret) {
+        let Ok(Some(rec)) = self
+            .db(|st| st.pockets())
+            .map(|v| v.into_iter().find(|r| r.info.id == pocket_id))
+        else {
+            return;
+        };
+        let mut meta = Self::meta(&rec);
+        if let Some(m) = meta.secrets.iter_mut().find(|m| m.name == s.name) {
+            *m = s.clone();
+            let _ = self.save_meta(pocket_id, &meta);
+        }
     }
 
     pub fn emit(&self, event: Event) {
@@ -162,6 +248,10 @@ impl Daemon {
             .entry(id.to_string())
             .or_default()
             .clone()
+    }
+
+    pub fn all_live(&self) -> Vec<Arc<Live>> {
+        self.live.lock().unwrap().values().cloned().collect()
     }
 
     pub fn live(&self, id: &str) -> Option<Arc<Live>> {
@@ -299,6 +389,7 @@ impl Daemon {
         };
         let profile = req.net_profile.clone().unwrap_or_else(|| "dev".into());
         net::policy_for(&profile, &req.allow)?;
+        let injected = self.select_secrets(&req)?;
         let name = self.pick_name(&req, repo.as_ref().map(|r| r.toplevel.as_path()))?;
         let id = hex(&random_bytes(8));
         let cid = self.db(|s| s.free_cid())?;
@@ -331,8 +422,10 @@ impl Daemon {
             vsock_cid: cid,
             vm_json: None,
             meta_json: serde_json::to_string(&Meta {
-                user: None,
                 allow: req.allow.clone(),
+                secrets: injected,
+                sync_config: req.sync_config,
+                ..Default::default()
             })
             .unwrap(),
         };
@@ -467,15 +560,14 @@ impl Daemon {
             }
         }
         let vsock_uds = rt.join("vsock.sock");
-        let meta: Meta = serde_json::from_str(&rec.meta_json).unwrap_or_default();
-        let proxy = net::proxy_ctx(self, rec, &meta.allow)?;
+        let (proxy, hooks) = self.egress(rec)?;
         let mut tasks = net::listen(self, rec, &vsock_uds, proxy.clone())?;
         let vm = self.backend.create(&spec).await.map_err(|e| {
             err(ErrorCode::Vmm, e.to_string()).hint(format!("see {}", spec.log_path.display()))
         })?;
         self.db(|s| s.set_vm(id, Some(&serde_json::to_string(&vm).unwrap())))?;
         let live = match self
-            .attach_guest(rec, vm.clone(), proxy, &mut tasks, true)
+            .attach_guest(rec, vm.clone(), proxy, hooks, &mut tasks, true)
             .await
         {
             Ok(l) => l,
@@ -495,6 +587,7 @@ impl Daemon {
         rec: &PocketRecord,
         vm: VmHandle,
         proxy: Arc<pocket_net::proxy::ProxyCtx>,
+        hooks: Arc<PocketHooks>,
         tasks: &mut Vec<JoinHandle<()>>,
         configure: bool,
     ) -> R<Arc<Live>> {
@@ -508,9 +601,10 @@ impl Daemon {
             guest.init_version,
             guest.boot_ns as f64 / 1e6
         );
-        drop(proxy);
         let mut meta: Meta = serde_json::from_str(&rec.meta_json).unwrap_or_default();
         if configure {
+            let mut env = proxy_env();
+            env.extend(provision::guest_env(&hooks));
             guest
                 .request(HostReq::Configure {
                     hostname: rec.info.name.clone(),
@@ -519,7 +613,7 @@ impl Daemon {
                         .duration_since(UNIX_EPOCH)
                         .map(|d| d.as_nanos())
                         .unwrap_or(0),
-                    env: proxy_env(),
+                    env,
                     proxy_port: GUEST_PROXY_PORT,
                 })
                 .await
@@ -539,6 +633,7 @@ impl Daemon {
                 .map_err(|e| err(ErrorCode::Guest, format!("probe guest user: {e}")))?;
             meta.user =
                 (String::from_utf8_lossy(&probe.stdout).trim() == "dev").then(|| "dev".into());
+            provision::provision(self, &guest, rec, &mut meta, &hooks).await?;
             let mj = serde_json::to_string(&meta).unwrap();
             self.db(|s| {
                 s.set_vm(&rec.info.id, Some(&serde_json::to_string(&vm).unwrap()))?;
@@ -552,6 +647,8 @@ impl Daemon {
             vm: vm.clone(),
             guest,
             user: meta.user,
+            proxy,
+            hooks,
             stopping: AtomicBool::new(false),
             tasks: Mutex::new(std::mem::take(tasks)),
         });
@@ -639,10 +736,10 @@ impl Daemon {
                     .adopt(&vm)
                     .await
                     .map_err(|e| err(ErrorCode::Vmm, e.to_string()))?;
-                let meta: Meta = serde_json::from_str(&rec.meta_json).unwrap_or_default();
-                let proxy = net::proxy_ctx(self, &rec, &meta.allow)?;
+                let (proxy, hooks) = self.egress(&rec)?;
                 let mut tasks = net::listen(self, &rec, &vm.vsock_uds, proxy.clone())?;
-                self.attach_guest(&rec, vm, proxy, &mut tasks, false).await
+                self.attach_guest(&rec, vm, proxy, hooks, &mut tasks, false)
+                    .await
             }
             .await;
             match result {
@@ -661,6 +758,114 @@ impl Daemon {
                 }
             }
         }
+    }
+
+    /// Injected secrets for a new pocket: placeholders generated now and kept in its meta.
+    fn select_secrets(&self, req: &NewPocket) -> R<Vec<InjectedSecret>> {
+        let all = self.db(|s| s.secrets())?;
+        let names: Vec<String> = match &req.secrets {
+            None => all.iter().map(|r| r.name.clone()).collect(),
+            Some(v) => v.clone(),
+        };
+        let mut out: Vec<InjectedSecret> = vec![];
+        for n in names.iter().chain(req.copy_secrets.iter()) {
+            if out.iter().any(|o| &o.name == n) {
+                continue;
+            }
+            let rec = all.iter().find(|r| &r.name == n).ok_or_else(|| {
+                err(ErrorCode::NotFound, format!("no secret named {n:?}"))
+                    .hint("`pocket secrets ls` lists secrets; add one with `pocket login` or `pocket secrets add`")
+            })?;
+            let info = secrets::info_from_record(rec);
+            let value = self.vault.get(n)?.ok_or_else(|| {
+                err(
+                    ErrorCode::HostSetup,
+                    format!("secret {n} has no stored value ({})", info.storage),
+                )
+                .hint(format!(
+                    "store it again with `pocket secrets add {n}` or `pocket login`"
+                ))
+            })?;
+            let mut s = InjectedSecret {
+                name: n.clone(),
+                copy_in: req.copy_secrets.contains(n),
+                ..Default::default()
+            };
+            if info.kind == "chatgpt" {
+                let c = inject::ChatGpt::parse(&value)?;
+                s.placeholder = secrets::placeholder(&c.refresh_token);
+                s.access_placeholder = Some(inject::placeholder_jwt(&c.access_token));
+                s.id_placeholder = Some(inject::placeholder_jwt(&c.id_token));
+            } else {
+                s.placeholder = secrets::placeholder(&value);
+            }
+            if s.copy_in {
+                tracing::warn!("secret {n}: real value copied into the new pocket (--copy-secret)");
+            }
+            out.push(s);
+        }
+        Ok(out)
+    }
+
+    /// The pocket's proxy context with its interception hooks.
+    fn egress(
+        self: &Arc<Self>,
+        rec: &PocketRecord,
+    ) -> R<(Arc<pocket_net::proxy::ProxyCtx>, Arc<PocketHooks>)> {
+        let meta = Self::meta(rec);
+        let all = self.db(|s| s.secrets())?;
+        let mut items = vec![];
+        for m in &meta.secrets {
+            let Some(r) = all.iter().find(|r| r.name == m.name) else {
+                tracing::warn!(
+                    "{}: secret {} no longer exists; not injected",
+                    rec.info.name,
+                    m.name
+                );
+                continue;
+            };
+            let info = secrets::info_from_record(r);
+            let real = match self.vault.get(&m.name) {
+                Ok(Some(v)) => v,
+                Ok(None) => {
+                    tracing::warn!(
+                        "{}: secret {} has no value; not injected",
+                        rec.info.name,
+                        m.name
+                    );
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            let chat = (info.kind == "chatgpt")
+                .then(|| inject::ChatGpt::parse(&real).ok())
+                .flatten();
+            items.push(inject::Item {
+                info,
+                real,
+                meta: m.clone(),
+                chat,
+                old_access: vec![],
+            });
+        }
+        let (resolver, connector) = net::upstream();
+        let hooks = Arc::new(PocketHooks::new(
+            rec.info.id.clone(),
+            items,
+            inject::Net {
+                resolver,
+                connector,
+                tls: self.upstream_tls(),
+            },
+            Arc::downgrade(self),
+        ));
+        let mitm = Arc::new(pocket_net::mitm::Mitm {
+            ca: self.ca()?,
+            client: self.upstream_tls(),
+            hooks: hooks.clone(),
+        });
+        let proxy = net::proxy_ctx(self, rec, &meta.allow, Some(mitm))?;
+        Ok((proxy, hooks))
     }
 
     pub async fn start(self: &Arc<Self>, name: &str) -> R<PocketInfo> {

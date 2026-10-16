@@ -110,6 +110,7 @@ async fn harness(policy: Policy) -> Harness {
         resolver: dns.clone(),
         connector: conn.clone(),
         log: Box::new(move |e| l2.lock().unwrap().push(e)),
+        mitm: None,
     });
     Harness {
         ctx,

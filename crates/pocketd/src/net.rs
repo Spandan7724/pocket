@@ -4,8 +4,9 @@
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 
+use pocket_net::mitm::Mitm;
 use pocket_net::policy::{Policy, Rule};
-use pocket_net::proxy::{ProxyCtx, SystemResolver, TcpConnector};
+use pocket_net::proxy::{Connector, ProxyCtx, Resolver, SystemResolver, TcpConnector};
 use pocket_proto::frame::{MAX_FRAME, decode};
 use pocket_proto::guest::{GIT_PORT, GitOpen, PROXY_PORT, ProxyOpen};
 use pocket_proto::rpc::{ErrorCode, Event};
@@ -35,28 +36,89 @@ pub fn policy_for(profile: &str, allow: &[String]) -> R<Policy> {
     Ok(p)
 }
 
-pub fn proxy_ctx(d: &Arc<Daemon>, rec: &PocketRecord, allow: &[String]) -> R<Arc<ProxyCtx>> {
+/// Upstream resolver and connector. Debug builds honour `POCKETD_TEST_UPSTREAM`
+/// (`host,host=127.0.0.1:port`) so integration tests can stand up fake HTTPS services on
+/// loopback, which the always-denied ranges would otherwise (rightly) refuse.
+pub fn upstream() -> (Arc<dyn Resolver>, Arc<dyn Connector>) {
+    #[cfg(debug_assertions)]
+    if let Ok(spec) = std::env::var("POCKETD_TEST_UPSTREAM")
+        && let Some((hosts, addr)) = spec.split_once('=')
+        && let Ok(addr) = addr.parse::<std::net::SocketAddr>()
+    {
+        let hosts: Vec<String> = hosts.split(',').map(String::from).collect();
+        return (
+            Arc::new(test_upstream::Dns(hosts)),
+            Arc::new(test_upstream::Redirect(addr)),
+        );
+    }
+    (Arc::new(SystemResolver), Arc::new(TcpConnector))
+}
+
+#[cfg(debug_assertions)]
+mod test_upstream {
+    use pocket_net::proxy::{ConnectFut, Connector, ResolveFut, Resolver, TcpConnector, Upstream};
+    use std::net::{IpAddr, SocketAddr};
+
+    /// TEST-NET-free public stand-in address for redirected names.
+    const FAKE: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(93, 184, 215, 14));
+
+    pub struct Dns(pub Vec<String>);
+    impl Resolver for Dns {
+        fn resolve<'a>(&'a self, host: &'a str) -> ResolveFut<'a> {
+            if self.0.iter().any(|h| h == host) {
+                return Box::pin(async { Ok(vec![FAKE]) });
+            }
+            pocket_net::proxy::SystemResolver.resolve(host)
+        }
+    }
+
+    pub struct Redirect(pub SocketAddr);
+    impl Connector for Redirect {
+        fn connect(&self, addr: SocketAddr) -> ConnectFut<'_> {
+            if addr.ip() != FAKE {
+                return TcpConnector.connect(addr);
+            }
+            let to = self.0;
+            Box::pin(async move {
+                Ok(Box::new(tokio::net::TcpStream::connect(to).await?) as Box<dyn Upstream>)
+            })
+        }
+    }
+}
+
+pub fn proxy_ctx(
+    d: &Arc<Daemon>,
+    rec: &PocketRecord,
+    allow: &[String],
+    mitm: Option<Arc<Mitm>>,
+) -> R<Arc<ProxyCtx>> {
     let policy = policy_for(&rec.info.net_profile, allow)?;
     let d2 = d.clone();
     let id = rec.info.id.clone();
+    let (resolver, connector) = upstream();
     Ok(Arc::new(ProxyCtx {
         pocket: rec.info.name.clone(),
         policy: RwLock::new(policy),
-        resolver: Arc::new(SystemResolver),
-        connector: Arc::new(TcpConnector),
+        resolver,
+        connector,
         log: Box::new(move |e| {
             tracing::info!(
-                "net {}: {:?} {} {}:{} {}",
+                "net {}: {:?} {} {}:{} {}{}",
                 e.pocket,
                 e.verdict,
                 e.kind,
                 e.host,
                 e.port,
-                e.reason
+                e.reason,
+                e.path
+                    .as_deref()
+                    .map(|p| format!(" {p}"))
+                    .unwrap_or_default()
             );
             let _ = d2.db(|s| s.log_net(&id, &e));
             d2.emit(Event::Net(e));
         }),
+        mitm,
     }))
 }
 

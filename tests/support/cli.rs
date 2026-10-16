@@ -38,7 +38,8 @@ impl Env {
                 bin_dir().join(b).display()
             );
         }
-        let mut extra = vec![];
+        // Never touch the user's keyring from tests.
+        let mut extra = vec![("POCKET_SECRET_STORE".to_string(), "file".to_string())];
         if let Some(c) = std::env::var_os("POCKET_PRESET_CACHE") {
             extra.push((
                 "POCKET_PRESET_CACHE".into(),
@@ -64,6 +65,7 @@ impl Env {
             .env("XDG_STATE_HOME", self.root.join("state"))
             .env("XDG_CACHE_HOME", self.root.join("cache"))
             .env("XDG_RUNTIME_DIR", self.root.join("run"))
+            .env("HOME", self.root.join("home"))
             .env("POCKET_ASSETS_DIR", &self.assets)
             .env("POCKETD", bin_dir().join("pocketd"))
             .env_remove("TERM");
@@ -105,6 +107,82 @@ impl Env {
 
     pub fn socket(&self) -> PathBuf {
         self.root.join("run/pocket/pocketd.sock")
+    }
+
+    /// `pocket args` with `input` on stdin.
+    pub fn pocket_stdin(&self, args: &[&str], input: &str) -> Output {
+        use std::io::Write;
+        let mut c = self
+            .cmd("pocket")
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        c.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+        let o = c.wait_with_output().unwrap();
+        eprintln!(
+            "$ pocket {} <<< (stdin)\n{}{}[exit {:?}]",
+            args.join(" "),
+            String::from_utf8_lossy(&o.stdout),
+            String::from_utf8_lossy(&o.stderr),
+            o.status.code()
+        );
+        o
+    }
+
+    /// Cloud Hypervisor API socket of a running pocket.
+    pub fn api_socket(&self, pocket: &str) -> PathBuf {
+        let list = self.json(&["ls"]);
+        let id = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == pocket)
+            .and_then(|p| p["id"].as_str())
+            .unwrap()
+            .to_string();
+        self.root
+            .join("run/pocket/p")
+            .join(&id[..12])
+            .join("api.sock")
+    }
+
+    /// Guest memory snapshot (pause, snapshot to `dest`, resume); returns the memory file.
+    pub fn memory_dump(&self, pocket: &str, dest: &Path) -> PathBuf {
+        let sock = self.api_socket(pocket);
+        let _ = std::fs::remove_dir_all(dest);
+        std::fs::create_dir_all(dest).unwrap();
+        let api = |call: &str, body: Option<String>| {
+            let mut c = Command::new("curl");
+            c.args(["-sS", "-f", "--unix-socket"]).arg(&sock).args([
+                "-X",
+                "PUT",
+                &format!("http://localhost/api/v1/{call}"),
+            ]);
+            if let Some(b) = body {
+                c.args(["-H", "Content-Type: application/json", "-d", &b]);
+            }
+            let o = c.output().unwrap();
+            assert!(
+                o.status.success(),
+                "{call}: {}",
+                String::from_utf8_lossy(&o.stderr)
+            );
+        };
+        api("vm.pause", None);
+        api(
+            "vm.snapshot",
+            Some(format!(
+                r#"{{"destination_url":"file://{}"}}"#,
+                dest.display()
+            )),
+        );
+        api("vm.resume", None);
+        let mem = dest.join("memory-ranges");
+        assert!(mem.exists(), "no memory-ranges in {}", dest.display());
+        mem
     }
 
     pub fn log(&self) -> String {

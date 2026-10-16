@@ -1,12 +1,17 @@
 //! pocketd: the per-user daemon (ARCHITECTURE.md §3.2). Started on demand by `pocket`.
 
+mod agentcfg;
 mod daemon;
 mod doctor;
+mod guard;
 mod guest;
+mod inject;
 mod net;
 mod paths;
 mod presets;
+mod provision;
 mod rpc;
+mod secrets;
 mod workspace;
 
 use std::os::fd::AsRawFd;

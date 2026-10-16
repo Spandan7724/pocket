@@ -18,6 +18,8 @@ pocket-image = { path = "../crates/pocket-image" }
 serde_json = "1"
 vt100 = "0.16"
 libc = "0.2"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
 
 [dev-dependencies]
 libc = "0.2"

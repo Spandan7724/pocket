@@ -136,6 +136,14 @@ pub struct PolicyRule {
     pub source: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecretRecord {
+    pub name: String,
+    pub provider: String,
+    pub bindings_json: String,
+    pub storage: String,
+}
+
 pub struct Store {
     conn: Connection,
 }
@@ -395,7 +403,7 @@ impl Store {
     pub fn log_net(&self, pocket_id: &str, e: &NetEntry) -> Result<()> {
         self.conn.execute(
             "INSERT INTO net_log (pocket_id, ts, kind, host, ip, port, method, path, status, \
-             bytes_up, bytes_down, verdict, reason) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+             bytes_up, bytes_down, verdict, reason, injected) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
             params![
                 pocket_id,
                 e.ts_ms as i64,
@@ -413,6 +421,7 @@ impl Store {
                     Verdict::Denied => "denied",
                 },
                 e.reason,
+                e.injected,
             ],
         )?;
         self.conn.execute(
@@ -426,7 +435,7 @@ impl Store {
     /// Most recent `limit` entries, oldest first.
     pub fn net_log(&self, pocket_id: &str, pocket_name: &str, limit: u32) -> Result<Vec<NetEntry>> {
         let mut st = self.conn.prepare(
-            "SELECT ts, kind, host, ip, port, method, path, status, bytes_up, bytes_down, verdict, reason \
+            "SELECT ts, kind, host, ip, port, method, path, status, bytes_up, bytes_down, verdict, reason, injected \
              FROM net_log WHERE pocket_id = ?1 ORDER BY seq DESC LIMIT ?2",
         )?;
         let rows = st.query_map(params![pocket_id, limit], |r| {
@@ -449,11 +458,43 @@ impl Store {
                     Verdict::Denied
                 },
                 reason: r.get(11)?,
+                injected: r.get(12)?,
             })
         })?;
         let mut v: Vec<NetEntry> = rows.collect::<rusqlite::Result<_>>()?;
         v.reverse();
         Ok(v)
+    }
+
+    /// Secret metadata only; values live in the secret store (`pocketd::secrets`).
+    pub fn put_secret(&self, r: &SecretRecord) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO secrets (name, provider, bindings_json, storage) VALUES (?1,?2,?3,?4)",
+            params![r.name, r.provider, r.bindings_json, r.storage],
+        )?;
+        Ok(())
+    }
+
+    pub fn secrets(&self) -> Result<Vec<SecretRecord>> {
+        let mut st = self
+            .conn
+            .prepare("SELECT name, provider, bindings_json, storage FROM secrets ORDER BY name")?;
+        let rows = st.query_map([], |r| {
+            Ok(SecretRecord {
+                name: r.get(0)?,
+                provider: r.get(1)?,
+                bindings_json: r.get(2)?,
+                storage: r.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn delete_secret(&self, name: &str) -> Result<bool> {
+        Ok(self
+            .conn
+            .execute("DELETE FROM secrets WHERE name = ?1", [name])?
+            > 0)
     }
 
     pub fn put_image(&self, i: &ImageRecord) -> Result<()> {
@@ -537,6 +578,7 @@ mod tests {
             bytes_down: 20,
             verdict: Verdict::Denied,
             reason: "not in allowlist".into(),
+            injected: false,
         }
     }
 
