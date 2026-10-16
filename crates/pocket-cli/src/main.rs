@@ -39,6 +39,7 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum Cmd {
     /// Create a pocket (cloning the current repo) and attach to its shell.
     New {
