@@ -24,6 +24,19 @@ fn git(dir: &Path, args: &[&str]) {
     );
 }
 
+/// Older virtiofsd (Ubuntu 24.04 ships 1.10) has no `--readonly`.
+fn ro_supported() -> bool {
+    [
+        "/usr/lib/virtiofsd",
+        "/usr/libexec/virtiofsd",
+        "/usr/bin/virtiofsd",
+    ]
+    .iter()
+    .find(|p| Path::new(p).exists())
+    .and_then(|p| Command::new(p).arg("--help").output().ok())
+    .is_some_and(|o| String::from_utf8_lossy(&o.stdout).contains("--readonly"))
+}
+
 #[test]
 fn sidekernel_checklist() {
     let Some(a) = kvm_or_skip() else { return };
@@ -98,7 +111,11 @@ fn sidekernel_checklist() {
         "--share-dir",
         &format!("{}:/mnt/shared", share.display()),
         "--share-dir",
-        &format!("{}:/mnt/big:ro", big.display()),
+        &format!(
+            "{}:/mnt/big{}",
+            big.display(),
+            if ro_supported() { ":ro" } else { "" }
+        ),
     ]);
     assert!(o.status.success());
     assert!(

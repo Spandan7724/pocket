@@ -116,6 +116,19 @@ pub async fn start_virtiofsd(
         )
         .hint("install it (Arch: virtiofsd, Debian/Ubuntu: virtiofsd) or drop --share-dir")
     })?;
+    if s.read_only {
+        let help = std::process::Command::new(&bin).arg("--help").output();
+        if !help.is_ok_and(|h| String::from_utf8_lossy(&h.stdout).contains("--readonly")) {
+            return Err(err(
+                ErrorCode::HostSetup,
+                format!(
+                    "{} has no --readonly option, needed for a read-only share",
+                    bin.display()
+                ),
+            )
+            .hint("upgrade virtiofsd (1.11 or newer), or share the directory writable"));
+        }
+    }
     let sock = rt.join(format!("fs{i}.sock"));
     // An unprivileged user namespace confines virtiofsd to the shared directory; fall back to
     // no sandbox only where namespaces are unavailable.
