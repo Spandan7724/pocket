@@ -167,6 +167,8 @@ pub struct Meta {
     /// Project template the pocket disk came from (`sandbox.setup`).
     #[serde(default)]
     pub template: Option<String>,
+    #[serde(default)]
+    pub shares: Vec<pocket_proto::rpc::ShareDir>,
 }
 
 fn yes() -> bool {
@@ -472,6 +474,7 @@ impl Daemon {
                 git_protected: req.git_protected.clone(),
                 git_allow_push: req.git_allow_push.clone(),
                 deny: req.deny.clone(),
+                shares: crate::share::validate(&req.share)?,
                 base_branch: repo.as_ref().and_then(|r| r.branch.clone()),
                 origin_host: repo
                     .as_ref()
@@ -636,7 +639,16 @@ impl Daemon {
             log_path: self.paths.pocket_dir(id).join("vmm.log"),
             serial_log: std::env::var_os("POCKET_SERIAL_LOG")
                 .map(|_| self.paths.pocket_dir(id).join("serial.log")),
+            shared_fs: vec![],
         };
+        let mut spec = spec;
+        let meta = Self::meta(rec);
+        let mut fs_tasks = vec![];
+        for (i, sh) in meta.shares.iter().enumerate() {
+            let (sock, task) = crate::share::start_virtiofsd(&self.paths, &rt, i, sh).await?;
+            spec.shared_fs.push((format!("pocketfs{i}"), sock));
+            fs_tasks.push(task);
+        }
         for p in [&spec.kernel, &self.paths.system_image(), &self.paths.vmm()] {
             if !p.exists() {
                 return Err(err(ErrorCode::HostSetup, format!("{} is missing", p.display()))
@@ -646,6 +658,7 @@ impl Daemon {
         let vsock_uds = rt.join("vsock.sock");
         let (proxy, hooks) = self.egress(rec)?;
         let mut tasks = net::listen(self, rec, &vsock_uds, proxy.clone())?;
+        tasks.extend(fs_tasks);
         self.agent_listener(rec, &vsock_uds, &mut tasks)?;
         let vm = self.backend.create(&spec).await.map_err(|e| {
             err(ErrorCode::Vmm, e.to_string()).hint(format!("see {}", spec.log_path.display()))
@@ -723,6 +736,7 @@ impl Daemon {
                 .map_err(|e| err(ErrorCode::Guest, format!("probe guest user: {e}")))?;
             meta.user =
                 (String::from_utf8_lossy(&probe.stdout).trim() == "dev").then(|| "dev".into());
+            crate::share::mount_all(&guest, &meta.shares).await?;
             provision::provision(self, &guest, rec, &mut meta, &hooks).await?;
             let mj = serde_json::to_string(&meta).unwrap();
             self.db(|s| {

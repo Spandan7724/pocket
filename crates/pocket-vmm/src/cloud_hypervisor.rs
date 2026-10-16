@@ -34,6 +34,8 @@ pub struct LaunchSpec {
     pub serial_log: Option<PathBuf>,
     /// virtio-balloon with free page reporting (starts deflated).
     pub balloon: bool,
+    /// virtio-fs devices `(tag, vhost-user socket)`; guest memory is then shared.
+    pub fs: Vec<(String, PathBuf)>,
 }
 
 impl LaunchSpec {
@@ -52,7 +54,15 @@ impl LaunchSpec {
             .arg("--cpus")
             .arg(format!("boot={}", self.vcpus))
             .arg("--memory")
-            .arg(format!("size={}M", self.memory_mib));
+            .arg(if self.fs.is_empty() {
+                format!("size={}M", self.memory_mib)
+            } else {
+                format!("size={}M,shared=on", self.memory_mib)
+            });
+        for (tag, sock) in &self.fs {
+            c.arg("--fs")
+                .arg(format!("tag={tag},socket={}", sock.display()));
+        }
         if !self.disks.is_empty() {
             c.arg("--disk");
             for d in &self.disks {
@@ -148,6 +158,7 @@ impl CloudHypervisor {
             api_socket: spec.runtime_dir.join("api.sock"),
             serial_log: spec.serial_log.clone(),
             balloon: true,
+            fs: spec.shared_fs.clone(),
         }
     }
 
@@ -501,6 +512,7 @@ mod tests {
             api_socket: "/api.sock".into(),
             serial_log: None,
             balloon: true,
+            fs: vec![],
         };
         let args: Vec<String> = spec
             .command()

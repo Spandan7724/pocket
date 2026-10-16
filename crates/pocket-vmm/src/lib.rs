@@ -119,6 +119,8 @@ pub struct VmSpec {
     pub log_path: PathBuf,
     /// Guest serial console is written here when set (debugging only; slow).
     pub serial_log: Option<PathBuf>,
+    /// virtio-fs shares `(tag, vhost-user socket)`, served by a virtiofsd the caller runs.
+    pub shared_fs: Vec<(String, PathBuf)>,
 }
 
 /// Everything needed to find a running VM again, also after a daemon restart.

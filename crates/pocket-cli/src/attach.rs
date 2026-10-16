@@ -370,6 +370,10 @@ fn approvals_overlay(s: &mut Session, client: &mut Client, pocket: &str) {
                 format!("  ssh signature with {key} {comment}"),
                 "  o sign this once · d deny · Esc back",
             ),
+            ApprovalWhat::File { path } => (
+                format!("  copy host file {path} into the pocket (/tmp/pocket-files/)"),
+                "  o copy it · d deny · Esc back",
+            ),
         };
         let lines = vec![
             format!("  pocket · {pocket} · {} request(s) waiting", list.len()),

@@ -198,6 +198,21 @@ fn allow(args: &[String]) -> io::Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+fn request_file(args: &[String]) -> io::Result<ExitCode> {
+    let Some(path) = args.first().filter(|p| p.starts_with('/')) else {
+        eprintln!("usage: pocket-guest request-file /ABSOLUTE/HOST/PATH");
+        return Ok(ExitCode::from(2));
+    };
+    to_host(GuestEvent::ApprovalRequest {
+        kind: ApprovalKind::File { path: path.clone() },
+    })?;
+    let name = path.rsplit('/').next().unwrap_or("file");
+    eprintln!(
+        "pocket: asked the user for {path}; once approved it appears as /tmp/pocket-files/{name}"
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
 fn b64(data: &[u8]) -> String {
     const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
@@ -287,9 +302,10 @@ fn main() -> ExitCode {
             Some("open") => open(&rest[1..]),
             Some("notify") => notify(&rest[1..]),
             Some("allow") => allow(&rest[1..]),
+            Some("request-file") => request_file(&rest[1..]),
             _ => {
                 eprintln!(
-                    "usage: pocket-guest open URL | notify [--title T] TEXT | allow HOST[:PORT]"
+                    "usage: pocket-guest open URL | notify [--title T] TEXT | allow HOST[:PORT] | request-file PATH"
                 );
                 Ok(ExitCode::from(2))
             }

@@ -96,6 +96,16 @@ pub struct NewPocket {
     /// `sandbox.setup` from pocket.toml: baked into a project template.
     #[serde(default)]
     pub setup: Option<Setup>,
+    /// Host directories shared into the pocket over virtio-fs (explicit opt-in).
+    #[serde(default)]
+    pub share: Vec<ShareDir>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShareDir {
+    pub host: PathBuf,
+    pub guest: String,
+    pub read_only: bool,
 }
 
 /// A project setup step and the content hashes of its inputs (template key material).
@@ -116,6 +126,8 @@ pub enum ApprovalWhat {
     },
     /// An ssh-agent signature request.
     SshSign { key: String, comment: String },
+    /// The pocket asks for a copy of a host file.
+    File { path: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -642,6 +654,7 @@ mod tests {
                     git_protected: vec![],
                     git_allow_push: vec![],
                     setup: None,
+                    share: vec![],
                 }),
             },
             ClientMsg::Subscribe {

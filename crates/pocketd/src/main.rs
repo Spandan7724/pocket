@@ -14,6 +14,7 @@ mod provision;
 mod review;
 mod rpc;
 mod secrets;
+mod share;
 mod sshagent;
 mod workspace;
 

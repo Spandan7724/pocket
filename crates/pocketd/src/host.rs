@@ -187,6 +187,21 @@ impl Daemon {
                     "requested from inside the pocket",
                 );
             }
+            GuestEvent::ApprovalRequest {
+                kind: ApprovalKind::File { path },
+            } => {
+                let info = ApprovalInfo {
+                    id: self.next_approval(),
+                    pocket: live.name.clone(),
+                    what: ApprovalWhat::File { path },
+                    created_ms: now_ms(),
+                };
+                self.approvals.lock().unwrap().push(Pending {
+                    info: info.clone(),
+                    waiter: None,
+                });
+                self.emit(Event::Approval(info));
+            }
             GuestEvent::SessionExited { .. } | GuestEvent::Metrics { .. } => {}
         }
     }
@@ -335,6 +350,11 @@ impl Daemon {
             self.net_allow(&p.info.pocket, &[rule], decision == Decision::Once)
                 .await?;
         }
+        if let ApprovalWhat::File { path } = &p.info.what
+            && decision != Decision::Deny
+        {
+            self.copy_file_in(&p.info.pocket, path).await?;
+        }
         if let Some(w) = p.waiter {
             let _ = w.send(decision);
         }
@@ -457,6 +477,62 @@ impl Daemon {
                 decision: Decision::Deny,
             });
         }
+        Ok(())
+    }
+
+    /// Copies an approved host file to `/tmp/pocket-files/` in the pocket (regular files
+    /// up to 64 MiB; the path the user approved is the one opened, symlinks resolved).
+    async fn copy_file_in(&self, pocket: &str, path: &str) -> R<()> {
+        let rec = self.find(pocket)?;
+        let live = self.live(&rec.info.id).ok_or_else(|| {
+            err(
+                ErrorCode::InvalidState,
+                format!("pocket {} is not running", rec.info.name),
+            )
+        })?;
+        let real = std::fs::canonicalize(path)
+            .map_err(|e| err(ErrorCode::NotFound, format!("{path}: {e}")))?;
+        let meta = std::fs::metadata(&real)
+            .map_err(|e| err(ErrorCode::NotFound, format!("{path}: {e}")))?;
+        if !meta.is_file() || meta.len() > 64 << 20 {
+            return Err(err(
+                ErrorCode::BadRequest,
+                format!("{path} is not a regular file up to 64 MiB"),
+            ));
+        }
+        let data = std::fs::read(&real)
+            .map_err(|e| err(ErrorCode::Internal, format!("read {path}: {e}")))?;
+        let name: String = real
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "file".into())
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || "._-".contains(c) {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let dest = format!("/tmp/pocket-files/{name}");
+        crate::provision::sh_args(
+            &live.guest,
+            live.user.as_deref(),
+            "set -e; mkdir -p /tmp/pocket-files; cat > \"$1.tmp\"; mv \"$1.tmp\" \"$1\"",
+            &[&dest],
+            data,
+            "copy a host file in",
+        )
+        .await?;
+        tracing::info!("{}: copied {} to {dest}", rec.info.name, real.display());
+        self.emit(Event::Notice {
+            pocket: rec.info.name.clone(),
+            session: None,
+            kind: "notify".into(),
+            title: "copied into the pocket".into(),
+            body: dest,
+        });
         Ok(())
     }
 

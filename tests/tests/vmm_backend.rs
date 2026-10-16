@@ -54,6 +54,7 @@ async fn create_pause_resume_stop_in_a_cgroup_scope() {
         runtime_dir: dir.clone(),
         log_path: dir.join("vmm.log"),
         serial_log: None,
+        shared_fs: vec![],
     };
     let t0 = Instant::now();
     let vm = ch.create(&spec).await.unwrap();

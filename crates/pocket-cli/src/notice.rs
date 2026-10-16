@@ -197,6 +197,9 @@ fn describe(ev: &Event, pocket: &str) -> Option<String> {
                 "ssh signature requested ({}) — Ctrl-] a to review",
                 if comment.is_empty() { key } else { comment }
             ),
+            ApprovalWhat::File { path } => {
+                format!("the pocket asks for {path} — Ctrl-] a to review")
+            }
         }),
         Event::Notice {
             pocket: p,

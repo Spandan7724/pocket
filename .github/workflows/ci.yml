@@ -31,7 +31,7 @@ jobs:
         run: |
           sudo apt-get update -q
           sudo apt-get install -q -y --no-install-recommends \
-            erofs-utils e2fsprogs bc bison flex libelf-dev libssl-dev cpio
+            erofs-utils e2fsprogs bc bison flex libelf-dev libssl-dev cpio virtiofsd
 
       - name: Build directory on the large disk
         run: |

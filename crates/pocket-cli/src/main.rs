@@ -94,6 +94,10 @@ enum Cmd {
         /// Don't forward ports automatically when guest programs listen.
         #[arg(long)]
         no_auto_forward: bool,
+        /// Share a host directory into the pocket over virtio-fs: HOST[:GUEST][:ro]
+        /// (default /mnt/NAME). The pocket can change these files.
+        #[arg(long = "share-dir")]
+        share_dirs: Vec<String>,
         /// Command for the default session instead of a login shell.
         #[arg(last = true)]
         command: Vec<String>,
@@ -659,8 +663,37 @@ fn command(c: &mut Client, cmd: Cmd, j: bool) -> Result<u8> {
             envs,
             forwards,
             no_auto_forward,
+            share_dirs,
             command,
         } => {
+            let mut share = vec![];
+            for d in share_dirs {
+                let mut parts: Vec<&str> = d.split(':').collect();
+                let read_only = parts.last() == Some(&"ro");
+                if read_only {
+                    parts.pop();
+                }
+                let host = PathBuf::from(parts[0]);
+                let guest = parts.get(1).map(|s| s.to_string()).unwrap_or_else(|| {
+                    format!(
+                        "/mnt/{}",
+                        host.file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| "share".into())
+                    )
+                });
+                if !read_only && !j {
+                    eprintln!(
+                        "warning: {} is shared writable: code in the pocket can change or delete these files",
+                        host.display()
+                    );
+                }
+                share.push(pocket_proto::rpc::ShareDir {
+                    host,
+                    guest,
+                    read_only,
+                });
+            }
             let flag_secrets = no_secrets || !secrets.is_empty();
             let mut env = vec![];
             for e in envs {
@@ -722,6 +755,7 @@ fn command(c: &mut Client, cmd: Cmd, j: bool) -> Result<u8> {
                 git_protected: vec![],
                 git_allow_push: vec![],
                 setup: None,
+                share,
             };
             let mut req = req;
             if let Some(repo) = req.repo.clone()
@@ -1236,6 +1270,9 @@ fn describe_approval(a: &pocket_proto::rpc::ApprovalInfo) -> String {
         ),
         pocket_proto::rpc::ApprovalWhat::SshSign { key, comment } => {
             format!("ssh sign  key {key} {comment}")
+        }
+        pocket_proto::rpc::ApprovalWhat::File { path } => {
+            format!("copy host file {path} into the pocket")
         }
     }
 }

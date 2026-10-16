@@ -222,7 +222,14 @@ pub enum Proto {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ApprovalKind {
-    Host { host: String, port: Option<u16> },
+    Host {
+        host: String,
+        port: Option<u16>,
+    },
+    /// Copy this host file into the pocket (`pocket-guest request-file`).
+    File {
+        path: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -583,6 +590,15 @@ impl Validate for GuestEvent {
             } => {
                 check(valid_hostname(host), "invalid host")?;
                 check(*port != Some(0), "port 0")
+            }
+            GuestEvent::ApprovalRequest {
+                kind: ApprovalKind::File { path },
+            } => {
+                abs_path(path)?;
+                check(
+                    !path.chars().any(char::is_control),
+                    "path contains control characters",
+                )
             }
             GuestEvent::Metrics { cpu_pct, .. } => check(
                 cpu_pct.is_finite() && (0.0..=100_000.0).contains(cpu_pct),
