@@ -159,6 +159,30 @@ impl Client {
             .and_then(|s| Client::handshake(s).ok())
     }
 
+    /// Pid of the process listening on the daemon socket, if it is ours. Used to stop a
+    /// pocketd whose RPC version we can't speak.
+    pub fn listener_pid() -> Option<i32> {
+        use std::os::fd::AsRawFd;
+        let s = UnixStream::connect(socket_path()).ok()?;
+        let mut cred = libc::ucred {
+            pid: 0,
+            uid: 0,
+            gid: 0,
+        };
+        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        // SAFETY: getsockopt writes at most `len` bytes into `cred`.
+        let rc = unsafe {
+            libc::getsockopt(
+                s.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                (&raw mut cred).cast(),
+                &mut len,
+            )
+        };
+        (rc == 0 && cred.pid > 0 && cred.uid == unsafe { libc::getuid() }).then_some(cred.pid)
+    }
+
     pub fn request_with(
         &mut self,
         req: Request,

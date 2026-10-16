@@ -178,6 +178,59 @@ fn rpc_handshake_rejects_version_mismatch() {
 }
 
 #[test]
+fn daemon_stop_stops_a_daemon_of_another_rpc_version() {
+    let env = Env::new("oldrpc", &std::env::temp_dir());
+    std::fs::create_dir_all(env.socket().parent().unwrap()).unwrap();
+    let path = env.socket();
+    let path = path.as_os_str().as_encoded_bytes();
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (d, s) in addr.sun_path.iter_mut().zip(path) {
+        *d = *s as libc::c_char;
+    }
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+    let rc = unsafe {
+        libc::bind(
+            fd,
+            (&raw const addr).cast(),
+            std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+        )
+    };
+    assert_eq!(rc, 0);
+    // The stand-in daemon must be its own process, and it must call listen() itself:
+    // SO_PEERCRED reports the listening process, which `daemon stop` signals. The child
+    // only makes raw syscalls (no allocation after fork).
+    let pid = unsafe { libc::fork() };
+    assert!(pid >= 0);
+    if pid == 0 {
+        unsafe { libc::listen(fd, 8) };
+        loop {
+            let c = unsafe { libc::accept(fd, std::ptr::null_mut(), std::ptr::null_mut()) };
+            if c >= 0 {
+                unsafe { libc::close(c) };
+            }
+        }
+    }
+    unsafe { libc::close(fd) };
+    // Until the child listens, connects are refused and the CLI would start a real pocketd.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while UnixStream::connect(env.socket()).is_err() {
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let o = env.pocket(&["daemon", "status"]);
+    assert!(
+        String::from_utf8_lossy(&o.stdout).contains(&format!("pid {pid}")),
+        "status names the unreachable daemon"
+    );
+    assert!(env.ok(&["daemon", "stop"]).contains("pocketd stopped"));
+    let mut st = 0;
+    assert_eq!(unsafe { libc::waitpid(pid, &mut st, 0) }, pid);
+    assert!(libc::WIFSIGNALED(st) && libc::WTERMSIG(st) == libc::SIGTERM);
+    std::fs::remove_file(env.socket()).unwrap();
+}
+
+#[test]
 fn doctor_reports_checks_and_fixes() {
     let Some(assets) = assets() else { return };
     let env = Env::new("doctor", &assets);

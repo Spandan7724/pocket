@@ -610,14 +610,18 @@ fn run(cli: Cli) -> Result<u8> {
             DaemonCmd::Stop => {
                 if let Some(mut c) = Client::connect_existing() {
                     c.request(Request::DaemonStop)?;
-                    drop(c);
-                    if !Client::wait_daemon_gone(std::time::Duration::from_secs(10)) {
-                        return Err(CliError::daemon("pocketd did not exit within 10 s"));
-                    }
-                    println!("pocketd stopped");
+                } else if let Some(pid) = Client::listener_pid() {
+                    // A pocketd of another RPC version; SIGTERM is its clean shutdown too.
+                    // SAFETY: plain kill(2) on a pid owned by our uid.
+                    unsafe { libc::kill(pid, libc::SIGTERM) };
                 } else {
                     println!("pocketd is not running");
+                    return Ok(0);
                 }
+                if !Client::wait_daemon_gone(std::time::Duration::from_secs(10)) {
+                    return Err(CliError::daemon("pocketd did not exit within 10 s"));
+                }
+                println!("pocketd stopped");
                 Ok(0)
             }
             DaemonCmd::Status => match Client::connect_existing() {
@@ -630,7 +634,14 @@ fn run(cli: Cli) -> Result<u8> {
                     Ok(0)
                 }
                 None => {
-                    println!("pocketd is not running");
+                    if let Some(pid) = Client::listener_pid() {
+                        println!(
+                            "pocketd running (pid {pid}) but speaks another RPC version; \
+                             restart it with `pocket daemon stop`"
+                        );
+                    } else {
+                        println!("pocketd is not running");
+                    }
                     Ok(1)
                 }
             },

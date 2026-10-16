@@ -213,15 +213,38 @@ impl Drop for Env {
         }
         // A daemon that refused us (e.g. the peer-credential test) is stopped by signal.
         let needle = format!("XDG_RUNTIME_DIR={}", self.root.join("run").display());
-        for e in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
-            let Ok(pid) = e.file_name().to_string_lossy().parse::<i32>() else {
-                continue;
-            };
-            let exe = std::fs::read_link(format!("/proc/{pid}/exe")).unwrap_or_default();
-            let env = std::fs::read(format!("/proc/{pid}/environ")).unwrap_or_default();
-            if exe.ends_with("pocketd") && env.split(|b| *b == 0).any(|v| v == needle.as_bytes()) {
-                unsafe { libc::kill(pid, libc::SIGTERM) };
+        let daemons = || {
+            std::fs::read_dir("/proc")
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter_map(|e| e.file_name().to_string_lossy().parse::<i32>().ok())
+                .filter(|pid| {
+                    // A rebuild during the run leaves the exe as "pocketd (deleted)".
+                    let exe = std::fs::read_link(format!("/proc/{pid}/exe")).unwrap_or_default();
+                    let env = std::fs::read(format!("/proc/{pid}/environ")).unwrap_or_default();
+                    exe.file_name()
+                        .is_some_and(|n| n.to_string_lossy().starts_with("pocketd"))
+                        && env.split(|b| *b == 0).any(|v| v == needle.as_bytes())
+                })
+                .collect::<Vec<_>>()
+        };
+        for pid in daemons() {
+            unsafe { libc::kill(pid, libc::SIGTERM) };
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let left = daemons();
+            if left.is_empty() {
+                break;
             }
+            if std::time::Instant::now() > deadline {
+                for pid in left {
+                    unsafe { libc::kill(pid, libc::SIGKILL) };
+                }
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
         }
         if std::thread::panicking() {
             eprintln!("--- pocketd.log\n{}", self.log());
