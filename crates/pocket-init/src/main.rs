@@ -5,6 +5,7 @@ mod boot;
 mod control;
 mod exec;
 mod netshim;
+mod ports;
 mod process;
 mod reaper;
 mod session;

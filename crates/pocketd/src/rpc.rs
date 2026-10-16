@@ -224,6 +224,42 @@ async fn handle(
                 digest: img.digest,
             }
         }
+        Request::Diff {
+            pocket,
+            uncommitted,
+            stat,
+            color,
+        } => Response::Text {
+            text: crate::review::diff(d, &pocket, uncommitted, stat, color).await?,
+            url: None,
+        },
+        Request::Apply {
+            pocket,
+            mode,
+            onto,
+            uncommitted,
+            message,
+        } => Response::Text {
+            text: crate::review::apply(d, &pocket, mode, onto, uncommitted, message).await?,
+            url: None,
+        },
+        Request::Pr {
+            pocket,
+            title,
+            body,
+            draft,
+            base,
+        } => {
+            let (text, url) = crate::review::pr(d, &pocket, title, body, draft, base).await?;
+            Response::Text {
+                text,
+                url: Some(url),
+            }
+        }
+        Request::Sync { pocket, rebase } => Response::Text {
+            text: crate::review::sync(d, &pocket, rebase).await?,
+            url: None,
+        },
         Request::ConfigPull { pocket, accept } => {
             Response::ConfigChanges(crate::agentcfg::pull(d, &pocket, accept).await?)
         }

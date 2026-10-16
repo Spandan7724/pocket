@@ -168,6 +168,33 @@ pub enum Request {
         pocket: String,
         accept: Option<Vec<(String, String)>>,
     },
+    /// Fetches the pocket's work into `refs/pocket/<name>/*` (hardened) and diffs it.
+    Diff {
+        pocket: String,
+        uncommitted: bool,
+        stat: bool,
+        color: bool,
+    },
+    Apply {
+        pocket: String,
+        mode: ApplyMode,
+        onto: Option<String>,
+        uncommitted: bool,
+        message: Option<String>,
+    },
+    /// Pushes the pocket branch from the host and opens a pull request.
+    Pr {
+        pocket: String,
+        title: Option<String>,
+        body: Option<String>,
+        draft: bool,
+        base: Option<String>,
+    },
+    /// Brings the latest host branch into the pocket (merge, or rebase).
+    Sync {
+        pocket: String,
+        rebase: bool,
+    },
     SecretAdd(SecretAdd),
     SecretList,
     SecretRemove {
@@ -212,6 +239,18 @@ pub enum Response {
     Secret(SecretInfo),
     Secrets(Vec<SecretInfo>),
     ConfigChanges(Vec<ConfigChange>),
+    /// Human-readable result (diff text, apply summary, PR URL …) plus structured fields.
+    Text {
+        text: String,
+        url: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ApplyMode {
+    Squash,
+    Merge,
+    CherryPick,
 }
 
 /// One agent config file that differs between the pocket and the host.

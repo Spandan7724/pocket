@@ -125,6 +125,55 @@ enum Cmd {
         #[arg(long, short)]
         force: bool,
     },
+    /// Fetch the pocket's work (hardened, into refs/pocket/NAME/*) and show the diff.
+    Diff {
+        pocket: String,
+        /// Include uncommitted changes in the pocket.
+        #[arg(long)]
+        uncommitted: bool,
+        #[arg(long)]
+        stat: bool,
+    },
+    /// Bring the pocket's work into the host repository.
+    Apply {
+        pocket: String,
+        /// One commit with all changes (default).
+        #[arg(long, group = "mode")]
+        squash: bool,
+        /// A merge commit.
+        #[arg(long, group = "mode")]
+        merge: bool,
+        /// The pocket's commits, one by one.
+        #[arg(long, group = "mode")]
+        cherry_pick: bool,
+        /// Switch to this branch first.
+        #[arg(long)]
+        onto: Option<String>,
+        #[arg(long)]
+        uncommitted: bool,
+        #[arg(long, short)]
+        message: Option<String>,
+    },
+    /// Push the pocket branch from the host and open a pull request.
+    Pr {
+        pocket: String,
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long)]
+        body: Option<String>,
+        #[arg(long)]
+        draft: bool,
+        /// Base branch (default: the branch the pocket started from).
+        #[arg(long)]
+        base: Option<String>,
+    },
+    /// Bring the host's latest base branch into the pocket.
+    Sync {
+        pocket: String,
+        /// Rebase the pocket branch instead of merging.
+        #[arg(long)]
+        rebase: bool,
+    },
     /// Show a pocket's network log.
     Logs {
         pocket: String,
@@ -810,6 +859,86 @@ fn command(c: &mut Client, cmd: Cmd, j: bool) -> Result<u8> {
             }
             Ok(0)
         }
+        Cmd::Diff {
+            pocket,
+            uncommitted,
+            stat,
+        } => {
+            let p = resolve_pocket(c, &pocket)?;
+            let color = !j && term::is_tty(1) && std::env::var_os("NO_COLOR").is_none();
+            let r = c.request_with(
+                Request::Diff {
+                    pocket: p,
+                    uncommitted,
+                    stat,
+                    color,
+                },
+                progress_printer(j),
+            );
+            end_progress();
+            let Response::Text { text, .. } = r? else {
+                return Err(CliError::new("internal", 70, "unexpected reply"));
+            };
+            if j {
+                println!("{}", serde_json::json!({ "diff": text }));
+            } else if text.is_empty() {
+                println!("no changes");
+            } else {
+                print!("{text}");
+            }
+            Ok(0)
+        }
+        Cmd::Apply {
+            pocket,
+            squash: _,
+            merge,
+            cherry_pick,
+            onto,
+            uncommitted,
+            message,
+        } => {
+            let p = resolve_pocket(c, &pocket)?;
+            let mode = if merge {
+                pocket_proto::rpc::ApplyMode::Merge
+            } else if cherry_pick {
+                pocket_proto::rpc::ApplyMode::CherryPick
+            } else {
+                pocket_proto::rpc::ApplyMode::Squash
+            };
+            text_reply(
+                c.request(Request::Apply {
+                    pocket: p,
+                    mode,
+                    onto,
+                    uncommitted,
+                    message,
+                })?,
+                j,
+            )
+        }
+        Cmd::Pr {
+            pocket,
+            title,
+            body,
+            draft,
+            base,
+        } => {
+            let p = resolve_pocket(c, &pocket)?;
+            text_reply(
+                c.request(Request::Pr {
+                    pocket: p,
+                    title,
+                    body,
+                    draft,
+                    base,
+                })?,
+                j,
+            )
+        }
+        Cmd::Sync { pocket, rebase } => {
+            let p = resolve_pocket(c, &pocket)?;
+            text_reply(c.request(Request::Sync { pocket: p, rebase })?, j)
+        }
         Cmd::Login {
             provider,
             name,
@@ -822,6 +951,18 @@ fn command(c: &mut Client, cmd: Cmd, j: bool) -> Result<u8> {
         } => config_pull(c, &pocket, yes, j),
         Cmd::Doctor | Cmd::Daemon { .. } => unreachable!(),
     }
+}
+
+fn text_reply(r: Response, j: bool) -> Result<u8> {
+    let Response::Text { text, url } = r else {
+        return Err(CliError::new("internal", 70, "unexpected reply"));
+    };
+    if j {
+        println!("{}", serde_json::json!({ "message": text, "url": url }));
+    } else {
+        println!("{}", text.trim_end());
+    }
+    Ok(0)
 }
 
 fn config_pull(c: &mut Client, pocket: &str, yes: bool, j: bool) -> Result<u8> {

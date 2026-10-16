@@ -124,6 +124,70 @@ fn rejection(cmds: &[Command], caps: &[String], why: &[(String, String)]) -> Vec
     out
 }
 
+pub const DEFAULT_PROTECTED: &[&str] = &["main", "master", "release/*", "trunk", "develop"];
+pub const DEFAULT_ALLOW: &[&str] = &["pocket/*"];
+
+/// Guard for a pocket: its origin's host plus GitHub when a GitHub credential is injected.
+pub fn for_pocket(
+    meta: &crate::daemon::Meta,
+    hooks: &crate::inject::PocketHooks,
+) -> Option<PushGuard> {
+    let mut hosts: Vec<String> = meta.origin_host.iter().cloned().collect();
+    let github = hooks
+        .items
+        .read()
+        .unwrap()
+        .iter()
+        .any(|i| i.info.provider == "github");
+    if github && !hosts.iter().any(|h| h == "github.com") {
+        hosts.push("github.com".into());
+    }
+    if hosts.is_empty() {
+        return None;
+    }
+    let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+    let mut protected = if meta.git_protected.is_empty() {
+        s(DEFAULT_PROTECTED)
+    } else {
+        meta.git_protected.clone()
+    };
+    if let Some(b) = &meta.base_branch
+        && !protected.contains(b)
+    {
+        protected.push(b.clone());
+    }
+    Some(PushGuard {
+        hosts,
+        allow: if meta.git_allow_push.is_empty() {
+            s(DEFAULT_ALLOW)
+        } else {
+            meta.git_allow_push.clone()
+        },
+        protected,
+        created: Default::default(),
+    })
+}
+
+/// The decoded body prefix (receive-pack requests may be gzip-compressed).
+fn decoded(req: &ReqHead, body: &[u8]) -> Vec<u8> {
+    if !req
+        .header("content-encoding")
+        .is_some_and(|e| e.eq_ignore_ascii_case("gzip"))
+    {
+        return body.to_vec();
+    }
+    let mut out = vec![];
+    let mut d = flate2::read::GzDecoder::new(body);
+    let mut buf = [0u8; 8192];
+    while let Ok(n) = std::io::Read::read(&mut d, &mut buf) {
+        if n == 0 || out.len() > MAX_COMMANDS {
+            break;
+        }
+        out.extend_from_slice(&buf[..n]);
+    }
+    out
+}
+
 impl PushGuard {
     pub fn covers(&self, host: &str) -> bool {
         self.hosts
@@ -196,7 +260,8 @@ impl PushGuard {
             reason,
             denied: true,
         };
-        let Some((cmds, caps)) = parse_commands(body) else {
+        let body = decoded(req, body);
+        let Some((cmds, caps)) = parse_commands(&body) else {
             let why = if complete || body.len() < MAX_COMMANDS {
                 "malformed push request"
             } else {

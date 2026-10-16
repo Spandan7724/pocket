@@ -365,3 +365,21 @@ pub fn fchown(f: &File, uid: u32, gid: u32) -> io::Result<()> {
 pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
+
+/// Copies until EOF with plain read/write calls. `std::io::copy` may use `splice` on Linux,
+/// which can hold vsock data back until the sender closes.
+pub fn pump(mut from: impl std::io::Read, mut to: impl std::io::Write) -> io::Result<u64> {
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut total = 0;
+    loop {
+        let n = match from.read(&mut buf) {
+            Ok(0) => return Ok(total),
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        to.write_all(&buf[..n])?;
+        to.flush()?;
+        total += n as u64;
+    }
+}

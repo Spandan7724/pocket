@@ -129,6 +129,7 @@ fn handle(id: u64, req: HostReq) -> Result<Reply, GuestError> {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()) = env;
             netshim::start(proxy_port).map_err(io_err("proxy shim"))?;
+            crate::ports::start_watcher(vec![proxy_port]);
             Ok(Reply::Done)
         }
         HostReq::Exec {
@@ -219,12 +220,45 @@ pub fn serve_stream(conn: File) {
             token,
         } => session::attach(&session, size, replay_scrollback, &token, conn),
         StreamOpen::ExecIo { exec_id } => exec::attach_io(exec_id, conn),
-        StreamOpen::PortForward { .. } | StreamOpen::GitUploadPack { .. } => {
-            let err = GuestError::new(
-                ErrorKind::Unsupported,
-                "not implemented in this pocket-init",
-            );
-            let _ = send(&mut &conn, &StreamAck(Err(err)));
-        }
+        StreamOpen::GitUploadPack { repo } => git_upload_pack(&repo, conn),
+        StreamOpen::PortForward { port } => crate::ports::forward(port, conn),
     }
+}
+
+/// Serves `git upload-pack` on a guest repository for a host fetch (`pocket diff`). The
+/// host decides what to do with the objects; nothing here runs on the host.
+fn git_upload_pack(repo: &str, conn: File) {
+    let argv: Vec<String> = [
+        "git",
+        "-c",
+        "safe.directory=*",
+        "upload-pack",
+        "--strict",
+        repo,
+    ]
+    .map(String::from)
+    .to_vec();
+    let mut child = match process::spawn(&argv, &[], "/", process::Stdio3::Pipes, None) {
+        Ok((c, _status)) => c,
+        Err(e) => {
+            let _ = send(&mut &conn, &StreamAck(Err(e)));
+            return;
+        }
+    };
+    if send(&mut &conn, &StreamAck(Ok(()))).is_err() {
+        let _ = child.kill();
+        return;
+    }
+    let (Some(mut stdin), Some(mut stdout)) = (child.stdin.take(), child.stdout.take()) else {
+        return;
+    };
+    drop(child.stderr.take());
+    let Ok(mut up) = conn.try_clone() else { return };
+    let t = std::thread::spawn(move || {
+        let _ = sys::pump(&mut up, &mut stdin);
+    });
+    let _ = sys::pump(&mut stdout, &conn);
+    sys::shutdown_write(&conn);
+    let _ = child.kill();
+    drop(t);
 }

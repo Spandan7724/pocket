@@ -10,6 +10,7 @@ mod net;
 mod paths;
 mod presets;
 mod provision;
+mod review;
 mod rpc;
 mod secrets;
 mod workspace;
@@ -31,7 +32,66 @@ fn lock(paths: &paths::Paths) -> std::io::Result<std::fs::File> {
     Ok(f)
 }
 
+/// `pocketd git-bridge <vsock-uds> <repo>`: the `ext::` transport for host fetches from a
+/// guest. Speaks git-upload-pack only; anything else (a push) is refused.
+fn git_bridge(args: &[String]) -> ExitCode {
+    use pocket_proto::guest::{STREAM_PORT, StreamAck, StreamOpen};
+    use std::io::{Read, Write};
+    let (Some(uds), Some(repo)) = (args.first(), args.get(1)) else {
+        eprintln!("usage: pocketd git-bridge VSOCK_UDS REPO");
+        return ExitCode::from(2);
+    };
+    if std::env::var("GIT_EXT_SERVICE").as_deref() != Ok("git-upload-pack") {
+        eprintln!("pocketd git-bridge: only git-upload-pack is allowed");
+        return ExitCode::from(2);
+    }
+    let run = || -> std::io::Result<()> {
+        let s = pocket_vmm::vsock::connect(std::path::Path::new(uds), STREAM_PORT)?;
+        pocket_proto::frame::send(&mut &s, &StreamOpen::GitUploadPack { repo: repo.clone() })
+            .map_err(std::io::Error::other)?;
+        match pocket_proto::frame::recv::<_, StreamAck>(&mut &s).map_err(std::io::Error::other)? {
+            Some(StreamAck(Ok(()))) => {}
+            Some(StreamAck(Err(e))) => return Err(std::io::Error::other(e.to_string())),
+            None => return Err(std::io::Error::other("pocket closed the stream")),
+        }
+        let mut up = s.try_clone()?;
+        std::thread::spawn(move || {
+            let mut stdin = std::io::stdin().lock();
+            let mut buf = vec![0u8; 64 * 1024];
+            while let Ok(n) = stdin.read(&mut buf) {
+                if n == 0 || up.write_all(&buf[..n]).is_err() {
+                    break;
+                }
+            }
+            let _ = up.shutdown(std::net::Shutdown::Write);
+        });
+        let mut down = &s;
+        let mut out = std::io::stdout().lock();
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            let n = down.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            out.write_all(&buf[..n])?;
+            out.flush()?;
+        }
+        Ok(())
+    };
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("pocketd git-bridge: {e}");
+            ExitCode::from(128)
+        }
+    }
+}
+
 fn main() -> ExitCode {
+    let argv: Vec<String> = std::env::args().collect();
+    if argv.get(1).map(String::as_str) == Some("git-bridge") {
+        return git_bridge(&argv[2..]);
+    }
     let foreground = std::env::args().any(|a| a == "--foreground");
     if std::env::args().any(|a| a == "--version") {
         println!("pocketd {}", env!("CARGO_PKG_VERSION"));

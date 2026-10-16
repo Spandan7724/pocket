@@ -141,6 +141,17 @@ pub struct Meta {
     pub sync_config: bool,
     #[serde(default)]
     pub provisioned: bool,
+    /// Host branch the pocket started from (PR base, `sync` source).
+    #[serde(default)]
+    pub base_branch: Option<String>,
+    /// Host of the guest's `origin` (HTTPS), push-guarded at the proxy.
+    #[serde(default)]
+    pub origin_host: Option<String>,
+    /// `git.protected` / `git.allow_push` (pocket.toml); empty = defaults.
+    #[serde(default)]
+    pub git_protected: Vec<String>,
+    #[serde(default)]
+    pub git_allow_push: Vec<String>,
 }
 
 impl Daemon {
@@ -425,6 +436,12 @@ impl Daemon {
                 allow: req.allow.clone(),
                 secrets: injected,
                 sync_config: req.sync_config,
+                base_branch: repo.as_ref().and_then(|r| r.branch.clone()),
+                origin_host: repo
+                    .as_ref()
+                    .and_then(|r| r.origin.as_deref())
+                    .and_then(pocket_git::github_repo)
+                    .map(|(h, _, _)| h),
                 ..Default::default()
             })
             .unwrap(),
@@ -859,6 +876,7 @@ impl Daemon {
             },
             Arc::downgrade(self),
         ));
+        *hooks.guard.write().unwrap() = crate::guard::for_pocket(&meta, &hooks);
         let mitm = Arc::new(pocket_net::mitm::Mitm {
             ca: self.ca()?,
             client: self.upstream_tls(),

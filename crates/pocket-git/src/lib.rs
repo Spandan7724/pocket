@@ -108,6 +108,167 @@ pub fn upload_pack(git_dir: &Path) -> Command {
     c
 }
 
+/// `ext::` URL running `argv` (git-remote-ext escaping: `% ` space, `%%` percent).
+pub fn ext_url(argv: &[&str]) -> String {
+    let parts: Vec<String> = argv
+        .iter()
+        .map(|a| a.replace('%', "%%").replace(' ', "% "))
+        .collect();
+    format!("ext::{}", parts.join(" "))
+}
+
+/// Config for fetches from a guest: only our `ext::` bridge may be used as a transport, every
+/// object is checked, no hooks, submodules, maintenance or commit-graph writes.
+const FETCH_HARDEN: &[&str] = &[
+    "-c",
+    "protocol.ext.allow=always",
+    "-c",
+    "fetch.fsckObjects=true",
+    "-c",
+    "transfer.fsckObjects=true",
+    "-c",
+    "fetch.recurseSubmodules=false",
+    "-c",
+    "submodule.recurse=false",
+    "-c",
+    "gc.auto=0",
+    "-c",
+    "maintenance.auto=false",
+    "-c",
+    "fetch.writeCommitGraph=false",
+    "-c",
+    "fetch.prune=false",
+    "-c",
+    "core.askPass=",
+];
+
+/// `refs/pocket/<name>/` namespace prefix; `name` must already be a valid pocket name.
+pub fn pocket_ns(name: &str) -> String {
+    format!("refs/pocket/{name}/")
+}
+
+/// Fetches a guest's branches (and `refs/pocket/uncommitted` when `uncommitted`) into
+/// `refs/pocket/<name>/*` of the host repo through `bridge` (argv of a command speaking
+/// git-upload-pack to the guest). Nothing else in the repo is written.
+pub fn fetch_from_guest(
+    repo: &Path,
+    bridge: &[&str],
+    name: &str,
+    uncommitted: bool,
+) -> Result<String, GitError> {
+    let ns = pocket_ns(name);
+    let mut specs = vec![format!("+refs/heads/*:{ns}*")];
+    if uncommitted {
+        specs.push(format!("+refs/pocket/uncommitted:{ns}__uncommitted"));
+    }
+    let url = ext_url(bridge);
+    let mut c = git(repo);
+    c.args(FETCH_HARDEN)
+        .args([
+            "fetch",
+            "--quiet",
+            "--no-tags",
+            "--no-write-fetch-head",
+            "--no-recurse-submodules",
+            "--no-auto-maintenance",
+            "--refmap=",
+            "--prune",
+        ])
+        .arg(&url)
+        .args(&specs)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env_remove("GIT_ASKPASS")
+        .env_remove("SSH_ASKPASS");
+    let o = c.output()?;
+    if !o.status.success() {
+        return Err(GitError::Failed {
+            args: "fetch from the pocket".into(),
+            msg: String::from_utf8_lossy(&o.stderr).trim().to_string(),
+        });
+    }
+    Ok(String::from_utf8_lossy(&o.stderr).into_owned())
+}
+
+/// Refs in the pocket's namespace: `(short name under the namespace, commit)`.
+pub fn pocket_refs(repo: &Path, name: &str) -> Result<Vec<(String, String)>, GitError> {
+    let ns = pocket_ns(name);
+    let out = text(
+        repo,
+        &["for-each-ref", "--format=%(refname) %(objectname)", &ns],
+    )?;
+    Ok(out
+        .lines()
+        .filter_map(|l| l.split_once(' '))
+        .filter_map(|(r, o)| r.strip_prefix(&ns).map(|s| (s.to_string(), o.to_string())))
+        .collect())
+}
+
+/// Runs host git in the user's repo with the user's own config and hooks (the guest never
+/// touched them) but no submodule recursion; returns stdout or the error text.
+pub fn user_git(repo: &Path, args: &[&str]) -> Result<String, GitError> {
+    let o = Command::new("git")
+        .args(["-c", "submodule.recurse=false", "-c", "protocol.allow=user"])
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .stdin(Stdio::null())
+        .output()?;
+    if !o.status.success() {
+        let mut msg = String::from_utf8_lossy(&o.stderr).trim().to_string();
+        if msg.is_empty() {
+            msg = String::from_utf8_lossy(&o.stdout).trim().to_string();
+        }
+        return Err(GitError::Failed {
+            args: args.join(" "),
+            msg,
+        });
+    }
+    Ok(String::from_utf8_lossy(&o.stdout).into_owned())
+}
+
+/// Diff text between `base` (or the empty tree) and `head`, with external diff drivers and
+/// textconv off so content from a pocket never selects a program to run.
+pub fn diff(
+    repo: &Path,
+    base: Option<&str>,
+    head: &str,
+    stat: bool,
+    color: bool,
+) -> Result<String, GitError> {
+    const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+    let range = match base {
+        Some(b) => format!("{b}...{head}"),
+        None => format!("{EMPTY_TREE}..{head}"),
+    };
+    let mut args = vec!["diff", "--no-ext-diff", "--no-textconv", "--find-renames"];
+    args.push(if color {
+        "--color=always"
+    } else {
+        "--no-color"
+    });
+    if stat {
+        args.push("--stat");
+    }
+    args.push(&range);
+    run(repo, &args).map(|o| String::from_utf8_lossy(&o).into_owned())
+}
+
+/// `owner/repo` of a GitHub remote URL.
+pub fn github_repo(url: &str) -> Option<(String, String, String)> {
+    let https = https_url(url)?;
+    let rest = https.strip_prefix("https://")?;
+    let (host, path) = rest.split_once('/')?;
+    let path = path.trim_end_matches('/').trim_end_matches(".git");
+    let (owner, repo) = path.split_once('/')?;
+    if owner.is_empty() || repo.is_empty() || repo.contains('/') {
+        return None;
+    }
+    Some((host.to_string(), owner.to_string(), repo.to_string()))
+}
+
 /// HTTPS form of a remote URL, so the guest's `origin` goes through the egress proxy:
 /// `git@host:o/r.git` and `ssh://git@host/o/r` become `https://host/o/r.git`.
 pub fn https_url(url: &str) -> Option<String> {
@@ -195,6 +356,19 @@ mod tests {
         assert_eq!(https_url("/local/path"), None);
         assert_eq!(https_url("file:///x"), None);
         assert_eq!(https_url("git@evil host:a"), None);
+    }
+
+    #[test]
+    fn ext_urls_and_github_repos() {
+        assert_eq!(
+            ext_url(&["/a b/pocketd", "git-bridge", "50%"]),
+            "ext::/a% b/pocketd git-bridge 50%%"
+        );
+        assert_eq!(
+            github_repo("git@github.com:o/r.git"),
+            Some(("github.com".into(), "o".into(), "r".into()))
+        );
+        assert_eq!(github_repo("https://github.com/o/r/x"), None);
     }
 
     #[test]
