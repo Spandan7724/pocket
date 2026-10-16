@@ -102,7 +102,7 @@ fn ports_urls_notifications_approvals_and_project_config() {
         "--",
         "sh",
         "-c",
-        "sleep 2; printf '\\033]777;notify;Build;done\\007'; exec sh",
+        "sleep 2; printf '\\033]777;notify;Build;done\\007'; sleep 1.5; printf '\\a'; exec sh",
     ]);
     assert!(o.status.success());
     assert!(
@@ -179,6 +179,11 @@ fn ports_urls_notifications_approvals_and_project_config() {
             .filter(|l| l.contains("Build done"))
     });
     eprintln!("notifications:\n{note}");
+    until("bell notification", || {
+        std::fs::read_to_string(&notify_log)
+            .ok()
+            .filter(|l| l.contains("rang the bell"))
+    });
     sh("pocket-guest notify --title Tests all green");
     until("pocket-guest notify", || {
         std::fs::read_to_string(&notify_log)

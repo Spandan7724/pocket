@@ -134,10 +134,11 @@ fn pty_exec_and_errors() {
         .err()
         .unwrap();
     assert_eq!(err.kind, ErrorKind::NotFound);
+    // Port forwards land on guest loopback; nothing listens on 80 here.
     let err = open_stream(u, StreamOpen::PortForward { port: 80 })
         .err()
         .unwrap();
-    assert_eq!(err.kind, ErrorKind::Unsupported);
+    assert_eq!(err.kind, ErrorKind::NotFound, "{err}");
 }
 
 #[test]

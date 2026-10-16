@@ -163,7 +163,14 @@ impl Daemon {
             }
             GuestEvent::OpenUrl { url } => self.open_url(live, &url),
             GuestEvent::SessionBell { name } => {
-                self.notice(live, Some(name), "bell", "pocket", "bell");
+                let body = format!("session {name} rang the bell");
+                self.notice(
+                    live,
+                    Some(name),
+                    "bell",
+                    &format!("pocket · {}", live.name),
+                    &body,
+                );
             }
             GuestEvent::Notify {
                 session,
@@ -214,9 +221,6 @@ impl Daemon {
             title: title.into(),
             body: body.into(),
         });
-        if kind == "bell" {
-            return;
-        }
         let cmd = std::env::var("POCKET_NOTIFY_CMD").unwrap_or_else(|_| "notify-send".into());
         let _ = std::process::Command::new(cmd)
             .args(["-a", "pocket", title, body])
