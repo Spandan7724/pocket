@@ -439,6 +439,33 @@ fn copy_secret_is_an_explicit_opt_in() {
     let ph = get(&n1);
     assert!(ph.starts_with("pocket-") && ph != value);
     assert_eq!(get(&n2), value);
+    let bound = env.json(&[
+        "secrets",
+        "bind",
+        "svc",
+        "--host",
+        "*.example.org",
+        "--env",
+        "SVC2",
+        "--header",
+        "X-Api-Key: {}",
+    ]);
+    assert_eq!(
+        bound["hosts"],
+        serde_json::json!(["api.example.net", "*.example.org"])
+    );
+    assert_eq!(bound["env"], serde_json::json!(["SVC_TOKEN", "SVC2"]));
+    assert!(
+        !env.pocket(&["secrets", "bind", "svc", "--host", "10.0.0.0/8"])
+            .status
+            .success()
+    );
+    assert!(
+        !env.pocket(&["secrets", "rm", "svc"]).status.success(),
+        "rm needs confirmation"
+    );
+    env.ok(&["secrets", "rm", "-f", "svc"]);
+    assert_eq!(env.json(&["secrets", "ls"]), serde_json::json!([]));
     // Unknown secrets are an error, not a silent skip.
     let o = env.pocket(&[
         "new",

@@ -162,6 +162,12 @@ pub enum Request {
     Pull {
         preset: String,
     },
+    /// Agent config changed in the pocket: `accept` `None` previews; `Some` writes exactly
+    /// those `(path, sha256)` versions to the host.
+    ConfigPull {
+        pocket: String,
+        accept: Option<Vec<(String, String)>>,
+    },
     SecretAdd(SecretAdd),
     SecretList,
     SecretRemove {
@@ -205,6 +211,24 @@ pub enum Response {
     Doctor(Vec<Check>),
     Secret(SecretInfo),
     Secrets(Vec<SecretInfo>),
+    ConfigChanges(Vec<ConfigChange>),
+}
+
+/// One agent config file that differs between the pocket and the host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigChange {
+    /// Relative to the home directory, e.g. `.claude/settings.json`.
+    pub path: String,
+    /// Current host content for display (`None` = new file); secrets masked.
+    pub host: Option<String>,
+    /// What would be written, for display; secrets masked.
+    pub guest: String,
+    /// SHA-256 of the exact content that would be written (redactions restored).
+    pub sha256: String,
+    /// Why it can't be applied, if so.
+    pub blocked: Option<String>,
+    /// Security-relevant keys this change touches (hooks, MCP servers, commands …).
+    pub risky: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

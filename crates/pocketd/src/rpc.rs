@@ -224,6 +224,9 @@ async fn handle(
                 digest: img.digest,
             }
         }
+        Request::ConfigPull { pocket, accept } => {
+            Response::ConfigChanges(crate::agentcfg::pull(d, &pocket, accept).await?)
+        }
         Request::SecretAdd(a) => Response::Secret(d.secret_add(a)?),
         Request::SecretList => Response::Secrets(
             d.db(|s| s.secrets())?

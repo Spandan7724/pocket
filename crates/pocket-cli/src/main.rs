@@ -3,6 +3,7 @@
 
 mod attach;
 mod client;
+mod diff;
 mod error;
 mod exec;
 mod secrets;
@@ -149,6 +150,11 @@ enum Cmd {
         #[arg(long)]
         from_gh: bool,
     },
+    /// Agent config sync: `pocket config pull POCKET` reviews and copies changes back.
+    Config {
+        #[command(subcommand)]
+        cmd: ConfigCmd,
+    },
     /// Manage stored secrets and their destination bindings.
     Secrets {
         #[command(subcommand)]
@@ -160,6 +166,18 @@ enum Cmd {
     Daemon {
         #[command(subcommand)]
         cmd: DaemonCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConfigCmd {
+    /// Show agent config (~/.claude, ~/.codex) changed in a pocket and copy it back after
+    /// confirmation.
+    Pull {
+        pocket: String,
+        /// Apply without asking (the diff is still printed).
+        #[arg(long, short)]
+        yes: bool,
     },
 }
 
@@ -799,8 +817,86 @@ fn command(c: &mut Client, cmd: Cmd, j: bool) -> Result<u8> {
             from_gh,
         } => secrets::login(c, &provider, name, from_codex, from_gh, j),
         Cmd::Secrets { cmd } => secrets::secrets(c, cmd, j),
+        Cmd::Config {
+            cmd: ConfigCmd::Pull { pocket, yes },
+        } => config_pull(c, &pocket, yes, j),
         Cmd::Doctor | Cmd::Daemon { .. } => unreachable!(),
     }
+}
+
+fn config_pull(c: &mut Client, pocket: &str, yes: bool, j: bool) -> Result<u8> {
+    let p = resolve_pocket(c, pocket)?;
+    let Response::ConfigChanges(changes) = c.request(Request::ConfigPull {
+        pocket: p.clone(),
+        accept: None,
+    })?
+    else {
+        return Err(CliError::new("internal", 70, "unexpected reply"));
+    };
+    if j && !yes {
+        json(&changes);
+        return Ok(0);
+    }
+    if changes.is_empty() {
+        if !j {
+            println!("agent config in {p} matches the host");
+        }
+        return Ok(0);
+    }
+    if !j {
+        println!(
+            "Agent config changed in {p}. Config from a pocket can run commands on this machine \
+             (hooks, MCP servers, status line): review every line.\n"
+        );
+        for ch in &changes {
+            let state = if ch.host.is_none() { "new" } else { "modified" };
+            println!("── ~/{} ({state})", ch.path);
+            if !ch.risky.is_empty() {
+                println!("   ⚠ touches: {}", ch.risky.join(", "));
+            }
+            if let Some(b) = &ch.blocked {
+                println!("   ✗ skipped: {b}");
+                continue;
+            }
+            print!(
+                "{}",
+                diff::unified(ch.host.as_deref().unwrap_or(""), &ch.guest, 3)
+            );
+            println!();
+        }
+    }
+    let ok: Vec<_> = changes.iter().filter(|ch| ch.blocked.is_none()).collect();
+    if ok.is_empty() {
+        return Ok(0);
+    }
+    if !yes
+        && !confirm(&format!(
+            "copy {} file(s) to your home directory?",
+            ok.len()
+        ))
+    {
+        return Err(CliError::usage("nothing copied")
+            .hint("confirm interactively, or pass --yes after reviewing the diff"));
+    }
+    let Response::ConfigChanges(written) = c.request(Request::ConfigPull {
+        pocket: p,
+        accept: Some(
+            ok.iter()
+                .map(|ch| (ch.path.clone(), ch.sha256.clone()))
+                .collect(),
+        ),
+    })?
+    else {
+        return Err(CliError::new("internal", 70, "unexpected reply"));
+    };
+    if j {
+        json(&written);
+    } else {
+        for w in written {
+            println!("wrote ~/{}", w.path);
+        }
+    }
+    Ok(0)
 }
 
 fn main() -> ExitCode {
