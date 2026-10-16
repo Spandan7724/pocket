@@ -28,8 +28,10 @@ pub const GUEST_PROXY_PORT: u16 = 3128;
 const DEFAULT_CPUS: u8 = 2;
 const DEFAULT_MEMORY_MIB: u32 = 2048;
 const DEFAULT_DISK_MIB: u64 = 20 << 10;
-/// VMM overhead allowed on top of guest RAM in the cgroup memory limit.
-const VMM_OVERHEAD: u64 = 512 << 20;
+/// Allowed on top of guest RAM in the cgroup memory limit: the VMM itself plus base-image
+/// pages the guest reads through DAX, which are charged to the scope as file memory (an
+/// agent like Claude Code maps a few hundred MiB of it).
+const VMM_OVERHEAD: u64 = 1 << 30;
 
 pub type R<T> = Result<T, RpcError>;
 
