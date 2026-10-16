@@ -480,6 +480,25 @@ fn attach_notices_approval_overlay_clipboard_and_image_paste() {
         .success()
     );
 
+    // Inline notice for a newly forwarded port.
+    std::thread::sleep(Duration::from_secs(6));
+    let o = env.pocket(&[
+        "exec",
+        &n,
+        "--",
+        "sh",
+        "-c",
+        "nc -lk -p 8780 >/dev/null 2>&1 </dev/null & sleep 0.2; netstat -ltn | grep -q 8780",
+    ]);
+    assert!(o.status.success(), "nc listener");
+    let rows = p.wait_rows(
+        |r| {
+            r.last()
+                .is_some_and(|l| l.contains("pocket ▸ port 8780 forwarded to 127.0.0.1:"))
+        },
+        T,
+    );
+    eprintln!("notice: {}", rows.last().unwrap().trim_end());
     // OSC 52: writes pass (default allow), reads never do.
     let m = p.mark();
     p.write(b"printf '\\033]52;c;aGk=\\007'; printf '\\033]52;c;?\\007'; echo osc-done\r");
