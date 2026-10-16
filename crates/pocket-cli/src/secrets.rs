@@ -49,32 +49,106 @@ pub enum SecretsCmd {
     },
 }
 
-/// Hidden terminal input, or all of stdin when it is not a terminal.
+/// Hidden terminal input, or all of stdin when it is not a terminal. Escape sequences and
+/// control characters (line breaks included) are removed: tokens copied from a terminal
+/// often carry colors and the wrap's line breaks.
 pub fn read_secret(prompt: &str) -> Result<String> {
     if !term::is_tty(0) {
-        let mut s = String::new();
+        let mut s = Vec::new();
         std::io::stdin()
-            .read_to_string(&mut s)
+            .read_to_end(&mut s)
             .map_err(|e| CliError::io("stdin", e))?;
-        return Ok(s.trim().to_string());
+        return Ok(clean(&s));
     }
     eprint!("{prompt}");
+    // Bracketed paste delivers a multi-line paste whole instead of ending at its first line.
+    eprint!("\x1b[?2004h");
     let _ = std::io::stderr().flush();
     // SAFETY: termios calls on fd 0, restored before returning.
     let old = unsafe {
         let mut t: libc::termios = std::mem::zeroed();
         libc::tcgetattr(0, &mut t);
         let old = t;
-        t.c_lflag &= !libc::ECHO;
+        t.c_lflag &= !(libc::ECHO | libc::ICANON | libc::ISIG);
+        t.c_cc[libc::VMIN] = 1;
+        t.c_cc[libc::VTIME] = 0;
         libc::tcsetattr(0, libc::TCSANOW, &t);
         old
     };
-    let mut s = String::new();
-    let r = std::io::stdin().read_line(&mut s);
+    let r = read_hidden(&mut std::io::stdin().lock());
     unsafe { libc::tcsetattr(0, libc::TCSANOW, &old) };
+    eprint!("\x1b[?2004l");
     eprintln!();
-    r.map_err(|e| CliError::io("terminal", e))?;
-    Ok(s.trim().to_string())
+    match r.map_err(|e| CliError::io("terminal", e))? {
+        Some(s) => Ok(clean(&s)),
+        None => Err(CliError::usage("cancelled")),
+    }
+}
+
+/// Reads until Enter, or until a bracketed paste ends; `None` on Ctrl-C / Ctrl-D.
+fn read_hidden(r: &mut impl Read) -> std::io::Result<Option<Vec<u8>>> {
+    const START: &[u8] = b"\x1b[200~";
+    const END: &[u8] = b"\x1b[201~";
+    let mut buf = Vec::new();
+    let mut pasting = false;
+    let mut b = [0u8; 1];
+    loop {
+        if r.read(&mut b)? == 0 {
+            return Ok(None);
+        }
+        buf.push(b[0]);
+        if buf.ends_with(START) {
+            buf.truncate(buf.len() - START.len());
+            pasting = true;
+        } else if buf.ends_with(END) {
+            buf.truncate(buf.len() - END.len());
+            return Ok(Some(buf));
+        } else if !pasting {
+            match b[0] {
+                b'\r' | b'\n' => return Ok(Some(buf)),
+                3 | 4 => return Ok(None),
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Drops ANSI escape sequences and control characters, then trims.
+fn clean(raw: &[u8]) -> String {
+    let s = String::from_utf8_lossy(raw);
+    let mut out = String::new();
+    let mut it = s.chars().peekable();
+    while let Some(c) = it.next() {
+        if c == '\x1b' {
+            match it.next() {
+                // CSI: parameters, then a final byte in @..~
+                Some('[') => {
+                    for c in it.by_ref() {
+                        if ('@'..='~').contains(&c) {
+                            break;
+                        }
+                    }
+                }
+                // OSC (e.g. hyperlinks): until BEL or ST
+                Some(']') => {
+                    while let Some(c) = it.next() {
+                        if c == '\x07' || (c == '\x1b' && it.next_if_eq(&'\\').is_some()) {
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        } else if !c.is_control() {
+            out.push(c);
+        }
+    }
+    out.trim().to_string()
+}
+
+/// Provider tokens never contain whitespace; a terminal wrap can add indentation.
+fn token(s: String) -> String {
+    s.split_whitespace().collect()
 }
 
 fn home() -> PathBuf {
@@ -119,10 +193,10 @@ pub fn login(
 ) -> Result<u8> {
     let (name, provider, value) = match provider {
         "claude" | "anthropic" => {
-            let v = read_secret(
+            let v = token(read_secret(
                 "Paste an Anthropic API key (sk-ant-api…) or a Claude subscription token from \
                  `claude setup-token` (sk-ant-oat…): ",
-            )?;
+            )?);
             if !v.starts_with("sk-ant-") {
                 return Err(CliError::usage("that does not look like an Anthropic key or token")
                     .hint("API keys start with sk-ant-api, `claude setup-token` tokens with sk-ant-oat"));
@@ -145,9 +219,9 @@ pub fn login(
                     _ => text,
                 }
             } else {
-                read_secret(
+                token(read_secret(
                     "Paste an OpenAI API key (sk-…), or rerun with --from-codex to use your Codex login: ",
-                )?
+                )?)
             };
             (name.unwrap_or_else(|| "openai".into()), "openai", v)
         }
@@ -168,9 +242,9 @@ pub fn login(
                 }
                 String::from_utf8_lossy(&o.stdout).trim().to_string()
             } else {
-                read_secret(
+                token(read_secret(
                     "Paste a GitHub token (a fine-grained token limited to the repos you work on is best): ",
-                )?
+                )?)
             };
             (name.unwrap_or_else(|| "github".into()), "github", v)
         }
@@ -287,5 +361,34 @@ pub fn secrets(c: &mut Client, cmd: SecretsCmd, j: bool) -> Result<u8> {
             }
             Ok(0)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn read(input: &[u8]) -> Option<String> {
+        read_hidden(&mut &input[..])
+            .unwrap()
+            .map(|b| token(clean(&b)))
+    }
+
+    #[test]
+    fn wrapped_colored_paste_becomes_one_token() {
+        let paste = b"\x1b[200~\x1b[1;32msk-ant-oat01-abc\x1b[0m\r\n  def\x1b]8;;https://x\x07ghi\x1b]8;;\x1b\\\x1b[201~";
+        assert_eq!(read(paste).unwrap(), "sk-ant-oat01-abcdefghi");
+    }
+
+    #[test]
+    fn typed_input_ends_at_enter_and_ctrl_c_cancels() {
+        assert_eq!(read(b"sk-ant-api03-x\rjunk").unwrap(), "sk-ant-api03-x");
+        assert_eq!(read(b"sk-\x03"), None);
+        assert_eq!(read(b""), None);
+    }
+
+    #[test]
+    fn piped_values_lose_controls_but_keep_inner_spaces() {
+        assert_eq!(clean(b"  Bearer abc\x1b[0m\n"), "Bearer abc");
     }
 }
