@@ -71,7 +71,7 @@ fn boot_via_rpc_exec_uname_and_cgroup_limits() {
             read("cpu.max"),
             read("pids.max")
         );
-        assert_eq!(read("memory.max"), ((1024u64 + 512) << 20).to_string());
+        assert_eq!(read("memory.max"), ((1024u64 + 1024) << 20).to_string());
         assert_eq!(read("cpu.max"), "200000 100000");
         assert_eq!(read("pids.max"), "4096");
         let procs = read("cgroup.procs");
