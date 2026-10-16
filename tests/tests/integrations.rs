@@ -555,3 +555,104 @@ fn attach_notices_approval_overlay_clipboard_and_image_paste() {
     p.write(b"\x1dd");
     p.wait_exit(T);
 }
+
+#[test]
+fn setup_builds_a_project_template() {
+    let Some(a) = kvm_or_skip() else { return };
+    let env = Env::new("setup", a.system.parent().unwrap());
+    let repo = env.root.join("app");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join("deps.txt"), "left-pad 1\n").unwrap();
+    std::fs::write(
+        repo.join("pocket.toml"),
+        "version = 1\n[sandbox]\npreset = \"base\"\nsetup = \"date +%s%N > .setup-stamp; cp deps.txt .setup-deps\"\nsetup_inputs = [\"deps.txt\"]\n",
+    )
+    .unwrap();
+    git(&repo, &["add", "."]);
+    git(
+        &repo,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-qm",
+            "init",
+        ],
+    );
+    let r = repo.to_str().unwrap();
+    let new = |n: &str| {
+        let o = env.pocket(&["new", n, "--repo", r, "--detach"]);
+        assert!(o.status.success());
+        String::from_utf8_lossy(&o.stderr).into_owned()
+    };
+    let sh = |n: &str, s: &str| {
+        env.ok(&["exec", n, "--", "bash", "-c", s])
+            .trim()
+            .to_string()
+    };
+    let p = std::process::id();
+    let (a1, a2, a3) = (format!("s1-{p}"), format!("s2-{p}"), format!("s3-{p}"));
+    let t1 = std::time::Instant::now();
+    assert!(new(&a1).contains("running setup"));
+    let first = t1.elapsed();
+    let stamp = sh(&a1, "cat /work/.setup-stamp");
+    let t2 = std::time::Instant::now();
+    let out = new(&a2);
+    eprintln!(
+        "first pocket (setup) {first:.1?}, second (template) {:.1?}",
+        t2.elapsed()
+    );
+    assert!(
+        !out.contains("running setup") && out.contains("updating the template"),
+        "{out}"
+    );
+    assert_eq!(
+        sh(&a2, "cat /work/.setup-stamp"),
+        stamp,
+        "setup output came from the template"
+    );
+    assert_eq!(
+        sh(&a2, "git -C /work branch --show-current"),
+        format!("pocket/{a2}")
+    );
+    assert_eq!(
+        sh(
+            &a2,
+            "git -C /work branch --format='%(refname:short)' | grep '^pocket/'"
+        ),
+        format!("pocket/{a2}")
+    );
+    let head = Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        sh(&a2, "git -C /work rev-parse HEAD"),
+        String::from_utf8_lossy(&head.stdout).trim()
+    );
+    // An uncommitted edit doesn't reach the pocket, so the template still applies…
+    std::fs::write(repo.join("deps.txt"), "left-pad 2\n").unwrap();
+    let a4 = format!("s4-{p}");
+    assert!(!new(&a4).contains("running setup"));
+    // …a committed change to an input means a new template.
+    git(
+        &repo,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-qam",
+            "deps",
+        ],
+    );
+    assert!(new(&a3).contains("running setup"));
+    assert_eq!(sh(&a3, "cat /work/.setup-deps"), "left-pad 2");
+    assert_ne!(sh(&a3, "cat /work/.setup-stamp"), stamp);
+}

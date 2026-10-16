@@ -368,10 +368,28 @@ pub fn apply(p: &Project, repo: &Path, req: &mut NewPocket, flags_secrets: bool)
     if let Some(cmd) = &p.setup {
         let mut inputs = vec![];
         for i in &p.setup_inputs {
-            let data = std::fs::read(repo.join(i)).map_err(|e| {
-                CliError::io(&format!("setup input {i}"), e)
-                    .hint("list files that exist in the repository under sandbox.setup_inputs")
-            })?;
+            // The pocket clones HEAD (plus the working tree with --carry): hash what it gets.
+            let committed = (!req.carry_changes)
+                .then(|| {
+                    std::process::Command::new("git")
+                        .args(["-c", "core.fsmonitor=false", "-C"])
+                        .arg(repo)
+                        .args(["show", &format!("HEAD:{i}")])
+                        .stdin(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .output()
+                        .ok()
+                        .filter(|o| o.status.success())
+                        .map(|o| o.stdout)
+                })
+                .flatten();
+            let data = committed
+                .map(Ok)
+                .unwrap_or_else(|| std::fs::read(repo.join(i)))
+                .map_err(|e| {
+                    CliError::io(&format!("setup input {i}"), e)
+                        .hint("list files that exist in the repository under sandbox.setup_inputs")
+                })?;
             let h = Sha256::digest(&data)
                 .iter()
                 .map(|b| format!("{b:02x}"))

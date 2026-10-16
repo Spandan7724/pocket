@@ -118,6 +118,43 @@ pub async fn clone_in(_d: &Daemon, live: &Live, info: &RepoInfo, carry: bool) ->
         )
         .await?;
     }
+    finish(live, info, carry).await?;
+    Ok(branch)
+}
+
+/// A pocket whose disk came from a project template already has `/work` (with the setup's
+/// untracked output, e.g. `node_modules`): fetch the host's current commit and switch to
+/// this pocket's branch instead of cloning.
+pub async fn refresh(_d: &Daemon, live: &Live, info: &RepoInfo, carry: bool) -> R<String> {
+    let branch = format!("pocket/{}", live.name);
+    let head = info.head.as_deref().unwrap_or("HEAD");
+    run(
+        live,
+        &[
+            "/bin/sh",
+            "-c",
+            "set -e; cd /work; git fetch --quiet host; git checkout --quiet -f -B \"$1\" \"$2\"; \
+             for b in $(git for-each-ref --format='%(refname:short)' refs/heads/pocket/); do \
+               [ \"$b\" = \"$1\" ] || git branch --quiet -D \"$b\"; done",
+            "sh",
+            &branch,
+            head,
+        ],
+        None,
+        "update the template's repository",
+    )
+    .await?;
+    finish(live, info, carry).await?;
+    Ok(branch)
+}
+
+/// User identity and (optionally) the host's uncommitted changes.
+async fn finish(live: &Live, info: &RepoInfo, carry: bool) -> R<()> {
+    fn g<'a>(args: &[&'a str]) -> Vec<&'a str> {
+        let mut v = vec!["git", "-C", "/work"];
+        v.extend_from_slice(args);
+        v
+    }
     if let Some(n) = &info.user_name {
         run(live, &g(&["config", "user.name", n]), None, "git config").await?;
     }
@@ -162,7 +199,7 @@ pub async fn clone_in(_d: &Daemon, live: &Live, info: &RepoInfo, carry: bool) ->
             .await?;
         }
     }
-    Ok(branch)
+    Ok(())
 }
 
 #[cfg(test)]

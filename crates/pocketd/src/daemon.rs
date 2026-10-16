@@ -499,20 +499,51 @@ impl Daemon {
                     format!("create {}: {e}", dir.display()),
                 )
             })?;
+            let template = req
+                .setup
+                .as_ref()
+                .filter(|_| repo.as_ref().is_some_and(|r| r.head.is_some()))
+                .map(|s| {
+                    let key = template_key(&image.digest, s, rec.info.disk_bytes);
+                    (
+                        self.paths.templates().join(format!("project-{key}.raw")),
+                        key,
+                    )
+                });
+            let from_template = template.as_ref().is_some_and(|(p, _)| p.exists());
             progress("creating disk");
-            let mode = pocket_image::disk::create_pocket_disk(
-                &self.paths.templates(),
-                rec.info.disk_bytes,
-                &dir.join("disk.raw"),
-            )
-            .map_err(|e| err(ErrorCode::HostSetup, e.to_string()))?;
-            tracing::info!("{name}: disk via {mode:?}");
+            if let (true, Some((tpl, key))) = (from_template, &template) {
+                let mode = pocket_image::disk::clone_disk(tpl, &dir.join("disk.raw"))
+                    .map_err(|e| err(ErrorCode::HostSetup, e.to_string()))?;
+                tracing::info!("{name}: disk from project template {key} via {mode:?}");
+                let mut m = Self::meta(&rec);
+                m.template = Some(key.clone());
+                self.save_meta(&id, &m)?;
+            } else {
+                let mode = pocket_image::disk::create_pocket_disk(
+                    &self.paths.templates(),
+                    rec.info.disk_bytes,
+                    &dir.join("disk.raw"),
+                )
+                .map_err(|e| err(ErrorCode::HostSetup, e.to_string()))?;
+                tracing::info!("{name}: disk via {mode:?}");
+            }
             progress("booting");
+            let rec = self.find(&name)?;
             let live = self.boot(&rec, &image.path).await?;
             if let Some(info) = &repo {
-                progress("cloning repository");
-                let branch = workspace::clone_in(self, &live, info, req.carry_changes).await?;
+                let branch = if from_template {
+                    progress("updating the template's repository");
+                    workspace::refresh(self, &live, info, req.carry_changes).await?
+                } else {
+                    progress("cloning repository");
+                    workspace::clone_in(self, &live, info, req.carry_changes).await?
+                };
                 self.db(|s| s.set_workspace(&id, info.head.as_deref(), Some(&branch)))?;
+            }
+            if let (false, Some((tpl, key)), Some(setup)) = (from_template, &template, &req.setup) {
+                progress(&format!("running setup: {}", setup.command));
+                self.build_template(&live, setup, tpl, key).await?;
             }
             progress("starting session");
             self.create_session(
@@ -829,6 +860,89 @@ impl Daemon {
                 }
             }
         }
+    }
+
+    /// Runs `setup` in `/work` and keeps the resulting disk as the project template.
+    async fn build_template(
+        &self,
+        live: &Live,
+        setup: &pocket_proto::rpc::Setup,
+        tpl: &Path,
+        key: &str,
+    ) -> R<()> {
+        let started = std::time::Instant::now();
+        let out = tokio::time::timeout(
+            Duration::from_secs(1800),
+            live.guest.exec(
+                crate::guest::ExecReq {
+                    argv: &["/bin/sh", "-c", &setup.command],
+                    env: vec![],
+                    cwd: "/work",
+                    user: live.user.as_deref(),
+                    stdin: None,
+                },
+                1 << 20,
+            ),
+        )
+        .await
+        .map_err(|_| err(ErrorCode::Workspace, "setup ran for more than 30 minutes"))?
+        .map_err(guest_err)?;
+        if !out.ok() {
+            let tail: String = {
+                let t = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&out.stdout),
+                    out.stderr_text()
+                );
+                let lines: Vec<&str> = t.lines().collect();
+                lines[lines.len().saturating_sub(20)..].join("\n")
+            };
+            return Err(err(
+                ErrorCode::Workspace,
+                format!(
+                    "setup `{}` failed ({:?}):\n{tail}",
+                    setup.command, out.status
+                ),
+            )
+            .hint("fix sandbox.setup in pocket.toml; nothing was cached"));
+        }
+        tracing::info!("{}: setup done in {:.1?}", live.name, started.elapsed());
+        // Nothing pocket-specific (placeholders, copied agent config) goes into the template.
+        let _ = crate::provision::sh(
+            &live.guest,
+            None,
+            "rm -rf /home/*/.codex/auth.json /root/.codex/auth.json /tmp/pocket-paste; sync",
+            vec![],
+            "clean the template",
+        )
+        .await;
+        let disk = self.paths.pocket_dir(&live.id).join("disk.raw");
+        let tmp = tpl.with_extension("tmp");
+        let _ = std::fs::remove_file(&tmp);
+        self.backend
+            .pause(&live.vm)
+            .await
+            .map_err(|e| err(ErrorCode::Vmm, e.to_string()))?;
+        let copied = pocket_image::disk::clone_disk(&disk, &tmp);
+        self.backend
+            .resume(&live.vm)
+            .await
+            .map_err(|e| err(ErrorCode::Vmm, e.to_string()))?;
+        let saved = copied.map_err(|e| e.to_string()).and_then(|m| {
+            std::fs::rename(&tmp, tpl)
+                .map(|()| m)
+                .map_err(|e| e.to_string())
+        });
+        match saved {
+            Ok(mode) => tracing::info!("{}: project template {key} saved via {mode:?}", live.name),
+            Err(e) => tracing::warn!("{}: save project template: {e}", live.name),
+        }
+        if let Ok(Some(rec)) = self.db(|s| s.pocket(&live.name)) {
+            let mut m = Self::meta(&rec);
+            m.template = Some(key.to_string());
+            let _ = self.save_meta(&live.id, &m);
+        }
+        Ok(())
     }
 
     /// Injected secrets for a new pocket: placeholders generated now and kept in its meta.
@@ -1230,6 +1344,21 @@ impl Daemon {
             l.stopping.store(true, Ordering::SeqCst);
         }
     }
+}
+
+/// Project template key: base image, setup command and the content of its inputs, disk size.
+pub fn template_key(image: &str, s: &pocket_proto::rpc::Setup, disk_bytes: u64) -> String {
+    use sha2::Digest;
+    let mut h = sha2::Sha256::new();
+    h.update(b"pocket-project-template-v1\0");
+    h.update(image.as_bytes());
+    h.update(b"\0");
+    h.update(s.command.as_bytes());
+    for (p, d) in &s.inputs {
+        h.update(format!("\0{p}\0{d}").as_bytes());
+    }
+    h.update(disk_bytes.to_le_bytes());
+    hex(&h.finalize()[..8])
 }
 
 pub fn guest_err(e: crate::guest::GuestConnError) -> RpcError {
