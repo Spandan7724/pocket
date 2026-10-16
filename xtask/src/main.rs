@@ -2,6 +2,7 @@ mod assets;
 mod ci;
 mod kernel;
 mod lint;
+mod release;
 mod util;
 
 use std::process::ExitCode;
@@ -18,6 +19,7 @@ commands:
   presets                     build the preset images into the assets dir (isolated)
   lint-deps                   check crate dependency directions
   fuzz [SECONDS]              run every fuzz target (default 60 s each)
+  release                     build release tarballs, install script, PKGBUILD (local only)
   isolation-selftest          prove ci isolation cleans up after a failing, leaking command";
 
 fn main() -> ExitCode {
@@ -39,6 +41,7 @@ fn main() -> ExitCode {
         })(),
         Some("presets") => ci::presets_isolated(),
         Some("lint-deps") => lint::lint_deps(),
+        Some("release") => release::release(),
         Some("fuzz") => ci::fuzz_smoke(args.get(1).and_then(|s| s.parse().ok()).unwrap_or(60)),
         Some("isolation-selftest") => ci::selftest(),
         _ => {

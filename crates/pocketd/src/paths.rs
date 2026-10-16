@@ -21,6 +21,23 @@ fn xdg(var: &str, home_rel: &str) -> PathBuf {
         })
 }
 
+/// The data dir when assets were installed there, else next to the binary
+/// (`<prefix>/bin/pocketd` → `<prefix>/share/pocket`, packages), else the data dir.
+fn default_assets(data: &std::path::Path) -> PathBuf {
+    let has = |d: &std::path::Path| d.join("kernel/vmlinux").exists();
+    if has(data) {
+        return data.to_path_buf();
+    }
+    let beside = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent()?.parent().map(|p| p.join("share/pocket")));
+    beside
+        .into_iter()
+        .chain([PathBuf::from("/usr/share/pocket")])
+        .find(|d| has(d))
+        .unwrap_or_else(|| data.to_path_buf())
+}
+
 pub fn runtime_dir() -> PathBuf {
     match std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()) {
         Some(d) => PathBuf::from(d).join("pocket"),
@@ -34,7 +51,7 @@ impl Paths {
         let assets = std::env::var_os("POCKET_ASSETS_DIR")
             .filter(|v| !v.is_empty())
             .map(PathBuf::from)
-            .unwrap_or_else(|| data.clone());
+            .unwrap_or_else(|| default_assets(&data));
         Paths {
             state: xdg("XDG_STATE_HOME", ".local/state").join("pocket"),
             cache: xdg("XDG_CACHE_HOME", ".cache").join("pocket"),
