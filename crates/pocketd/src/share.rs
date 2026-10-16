@@ -102,6 +102,13 @@ fn virtiofsd(paths: &Paths) -> Option<PathBuf> {
     })
 }
 
+fn supports(bin: &Path, opt: &str) -> bool {
+    std::process::Command::new(bin)
+        .arg("--help")
+        .output()
+        .is_ok_and(|h| String::from_utf8_lossy(&h.stdout).contains(opt))
+}
+
 /// Starts virtiofsd for share `i`; it exits when the VMM disconnects.
 pub async fn start_virtiofsd(
     paths: &Paths,
@@ -117,8 +124,7 @@ pub async fn start_virtiofsd(
         .hint("install it (Arch: virtiofsd, Debian/Ubuntu: virtiofsd) or drop --share-dir")
     })?;
     if s.read_only {
-        let help = std::process::Command::new(&bin).arg("--help").output();
-        if !help.is_ok_and(|h| String::from_utf8_lossy(&h.stdout).contains("--readonly")) {
+        if !supports(&bin, "--readonly") {
             return Err(err(
                 ErrorCode::HostSetup,
                 format!(
@@ -153,6 +159,15 @@ pub async fn start_virtiofsd(
             .kill_on_drop(false);
         if s.read_only {
             c.arg("--readonly");
+        }
+        // The guest's `dev` user is uid/gid 1000; map it to the host user so it owns what
+        // it sees (older virtiofsd can't, and the share is then writable by guest root only).
+        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+        if (uid != 1000 || gid != 1000) && supports(&bin, "--translate-uid") {
+            c.arg("--translate-uid")
+                .arg(format!("map:1000:{uid}:1"))
+                .arg("--translate-gid")
+                .arg(format!("map:1000:{gid}:1"));
         }
         let mut child = c.spawn().map_err(|e| {
             err(

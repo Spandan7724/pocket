@@ -26,6 +26,10 @@ fn git(dir: &Path, args: &[&str]) {
 
 /// Older virtiofsd (Ubuntu 24.04 ships 1.10) has no `--readonly`.
 fn ro_supported() -> bool {
+    virtiofsd_has("--readonly")
+}
+
+fn virtiofsd_has(opt: &str) -> bool {
     [
         "/usr/lib/virtiofsd",
         "/usr/libexec/virtiofsd",
@@ -34,7 +38,7 @@ fn ro_supported() -> bool {
     .iter()
     .find(|p| Path::new(p).exists())
     .and_then(|p| Command::new(p).arg("--help").output().ok())
-    .is_some_and(|o| String::from_utf8_lossy(&o.stdout).contains("--readonly"))
+    .is_some_and(|o| String::from_utf8_lossy(&o.stdout).contains(opt))
 }
 
 #[test]
@@ -122,6 +126,23 @@ fn sidekernel_checklist() {
         String::from_utf8_lossy(&o.stderr).contains("is shared writable"),
         "share is visibly flagged"
     );
+    // Without uid translation (virtiofsd < 1.11) a host user other than 1000 owns the share
+    // as a foreign uid inside; guest root then does the share writes.
+    let host_uid = unsafe { libc::getuid() };
+    let share_root = host_uid != 1000 && !virtiofsd_has("--translate-uid");
+    if share_root {
+        eprintln!(
+            "note: host uid {host_uid} and no virtiofsd uid translation: share writes as guest root"
+        );
+    }
+    let shw = |s: &str| {
+        let mut a = vec!["exec", &n];
+        if share_root {
+            a.push("--root");
+        }
+        a.extend(["--", "bash", "-c", s]);
+        env.pocket(&a)
+    };
     let sh = |s: &str| env.pocket(&["exec", &n, "--", "bash", "-c", s]);
     let out = |s: &str| String::from_utf8_lossy(&sh(s).stdout).trim().to_string();
 
@@ -140,7 +161,7 @@ fn sidekernel_checklist() {
     // T2: permission bits.
     let guest_mode = out("stat -c %a /mnt/shared/script.sh");
     let ran = out("/mnt/shared/script.sh");
-    sh("echo x > /mnt/shared/p.txt && chmod 640 /mnt/shared/p.txt");
+    shw("echo x > /mnt/shared/p.txt && chmod 640 /mnt/shared/p.txt");
     let host_mode = std::fs::metadata(share.join("p.txt"))
         .map(|m| m.permissions().mode() & 0o777)
         .unwrap_or(0);
