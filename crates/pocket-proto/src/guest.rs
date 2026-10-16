@@ -15,12 +15,17 @@ use crate::frame::Validate;
 use crate::{ProtoError, invalid};
 
 /// Bump on every change to the types in this module.
-pub const PROTO_VERSION: u32 = 2;
+pub const PROTO_VERSION: u32 = 3;
 
 pub const CONTROL_PORT: u32 = 1024;
 pub const STREAM_PORT: u32 = 1025;
 pub const PROXY_PORT: u32 = 1026;
 pub const GIT_PORT: u32 = 1027;
+/// Guest → host: raw ssh-agent protocol to pocketd's filtering agent (opt-in per pocket).
+pub const SSH_AGENT_PORT: u32 = 1028;
+/// Longest notification title / body.
+pub const MAX_NOTIFY_TITLE: usize = 256;
+pub const MAX_NOTIFY_BODY: usize = 1024;
 
 pub const RNG_SEED_LEN: usize = 64;
 pub const ATTACH_TOKEN_LEN: usize = 32;
@@ -229,6 +234,12 @@ pub enum GuestEvent {
     /// Bell / OSC 9 / OSC 777 → host notification.
     SessionBell {
         name: String,
+    },
+    /// OSC 9 / OSC 777 notification text from a session, or `pocket-guest notify`.
+    Notify {
+        session: Option<String>,
+        title: String,
+        body: String,
     },
     PortOpened {
         port: u16,
@@ -536,6 +547,24 @@ impl Validate for GuestEvent {
                 status(s)
             }
             GuestEvent::SessionBell { name } => check(valid_name(name), "invalid session name"),
+            GuestEvent::Notify {
+                session,
+                title,
+                body,
+            } => {
+                session
+                    .as_deref()
+                    .map_or(Ok(()), |n| check(valid_name(n), "invalid session name"))?;
+                let printable = |t: &str| !t.chars().any(|c| c.is_control() && c != '\n');
+                check(
+                    title.len() <= MAX_NOTIFY_TITLE && printable(title),
+                    "invalid notification title",
+                )?;
+                check(
+                    body.len() <= MAX_NOTIFY_BODY && printable(body),
+                    "invalid notification body",
+                )
+            }
             GuestEvent::PortOpened { port, process, .. } => {
                 check(*port != 0, "port 0")?;
                 process

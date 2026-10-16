@@ -111,6 +111,7 @@ async fn harness(policy: Policy) -> Harness {
         connector: conn.clone(),
         log: Box::new(move |e| l2.lock().unwrap().push(e)),
         mitm: None,
+        on_block: None,
     });
     Harness {
         ctx,

@@ -119,6 +119,13 @@ pub fn proxy_ctx(
             d2.emit(Event::Net(e));
         }),
         mitm,
+        on_block: {
+            let d3 = d.clone();
+            let name = rec.info.name.clone();
+            Some(Box::new(move |host: &str, port: u16, why: &str| {
+                d3.request_network_approval(&name, host, Some(port), why);
+            }))
+        },
     }))
 }
 

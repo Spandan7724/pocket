@@ -98,6 +98,43 @@ fn git_script(github: bool, rewrite_ssh: bool) -> String {
     s
 }
 
+/// `sh -c script sh ARGS…` with `stdin`.
+pub async fn sh_args(
+    guest: &GuestConn,
+    user: Option<&str>,
+    script: &str,
+    args: &[&str],
+    stdin: Vec<u8>,
+    what: &str,
+) -> R<String> {
+    let mut argv = vec!["/bin/sh", "-c", script, "sh"];
+    argv.extend_from_slice(args);
+    let out = guest
+        .exec(
+            ExecReq {
+                argv: &argv,
+                env: vec![],
+                cwd: "/",
+                user,
+                stdin: Some(stdin),
+            },
+            1 << 20,
+        )
+        .await
+        .map_err(|e| err(ErrorCode::Guest, format!("{what}: {e}")))?;
+    if !out.ok() {
+        return Err(err(
+            ErrorCode::Guest,
+            format!(
+                "{what} failed in the pocket ({:?}): {}",
+                out.status,
+                out.stderr_text()
+            ),
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
 pub async fn sh(
     guest: &GuestConn,
     user: Option<&str>,
@@ -204,7 +241,7 @@ pub async fn provision(
     sh(
         guest,
         None,
-        &git_script(github, true),
+        &git_script(github, !meta.ssh_agent),
         vec![],
         "configure git",
     )

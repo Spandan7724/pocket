@@ -133,7 +133,17 @@ pub fn system() -> Result<PathBuf> {
     let dest_guest = staging.join("bin/pocket-guest");
     fs::copy(guest_binary()?, &dest_guest)?;
     fs::set_permissions(&dest_guest, fs::Permissions::from_mode(0o755))?;
-    std::os::unix::fs::symlink("pocket-guest", staging.join("bin/git-remote-pocket"))?;
+    for name in [
+        "git-remote-pocket",
+        "xdg-open",
+        "sensible-browser",
+        "x-www-browser",
+        "xclip",
+        "wl-paste",
+        "wl-copy",
+    ] {
+        std::os::unix::fs::symlink("pocket-guest", staging.join("bin").join(name))?;
+    }
     let img = system_image();
     mkfs_erofs(&img, &staging)?;
     let listing = output(

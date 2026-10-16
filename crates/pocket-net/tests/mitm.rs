@@ -191,6 +191,7 @@ async fn harness() -> H {
             client: pocket_net::tls::client_config(roots),
             hooks: Arc::new(Hooks),
         })),
+        on_block: None,
     });
     H {
         ctx,

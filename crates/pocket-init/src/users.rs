@@ -110,7 +110,7 @@ pub fn first_boot_setup() {
     // Login shells reset PATH, so expose the system helpers through /usr/local/bin.
     let helper = "/run/pocket/system/bin/pocket-guest";
     if Path::new(helper).exists() && Path::new("/usr/local/bin").is_dir() {
-        for name in ["pocket-guest", "git-remote-pocket"] {
+        for name in crate::guestsock::SHIMS {
             let link = Path::new("/usr/local/bin").join(name);
             if fs::symlink_metadata(&link).is_err() {
                 let _ = symlink(helper, &link);

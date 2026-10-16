@@ -113,6 +113,7 @@ pub fn create(
 fn pump(s: Arc<Session>, status: Receiver<ExitStatus>) {
     let mut buf = vec![0u8; CHUNK];
     let mut master = &s.master;
+    let mut scan = crate::notify::Scanner::default();
     loop {
         let n = match master.read(&mut buf) {
             Ok(0) => break,
@@ -121,6 +122,18 @@ fn pump(s: Arc<Session>, status: Receiver<ExitStatus>) {
             Err(_) => break, // EIO: no slave left open
         };
         let data = &buf[..n];
+        for f in scan.feed(data) {
+            control::broadcast(match f {
+                crate::notify::Found::Bell => GuestEvent::SessionBell {
+                    name: s.name.clone(),
+                },
+                crate::notify::Found::Notify { title, body } => GuestEvent::Notify {
+                    session: Some(s.name.clone()),
+                    title,
+                    body,
+                },
+            });
+        }
         let mut st = s.state();
         st.scrollback.extend(data);
         let excess = st.scrollback.len().saturating_sub(SCROLLBACK);

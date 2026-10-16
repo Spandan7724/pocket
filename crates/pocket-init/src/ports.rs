@@ -126,13 +126,15 @@ pub fn forward(port: u16, conn: File) {
     let (Ok(mut t2), Ok(mut c2)) = (tcp.try_clone(), conn.try_clone()) else {
         return;
     };
-    let up = std::thread::spawn(move || {
+    std::thread::spawn(move || {
         let _ = sys::pump(&mut c2, &mut t2);
         let _ = t2.shutdown(std::net::Shutdown::Write);
     });
     if let Err(e) = sys::pump(&tcp, &conn) {
         log!("port {port}: {e}");
     }
-    sys::shutdown_write(&conn);
-    let _ = up.join();
+    // The server closed: end the whole stream (half-closes don't cross the hybrid vsock).
+    // SAFETY: shutdown on an open socket we own.
+    unsafe { libc::shutdown(std::os::fd::AsRawFd::as_raw_fd(&conn), libc::SHUT_RDWR) };
+    let _ = tcp.shutdown(std::net::Shutdown::Both);
 }

@@ -4,7 +4,9 @@
 mod boot;
 mod control;
 mod exec;
+mod guestsock;
 mod netshim;
+mod notify;
 mod ports;
 mod process;
 mod reaper;

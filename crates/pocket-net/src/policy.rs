@@ -107,6 +107,11 @@ impl Rule {
         Ok(Rule { pattern, port })
     }
 
+    /// Whether this rule names `host:port` (ports: an explicit one, else 80/443).
+    pub fn allows(&self, host: &str, port: u16) -> bool {
+        self.matches_host(host) && self.port.map_or([80, 443].contains(&port), |p| p == port)
+    }
+
     fn matches_host(&self, host: &str) -> bool {
         match (&self.pattern, host.parse::<IpAddr>()) {
             (Pattern::Any, _) => true,

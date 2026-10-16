@@ -47,6 +47,8 @@ pub enum DaemonMsg {
 pub enum Topic {
     Pockets,
     Net,
+    /// Ports, approvals, notifications, opened URLs.
+    Notices,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,6 +64,8 @@ pub struct NewPocket {
     pub disk_mib: Option<u64>,
     pub net_profile: Option<String>,
     pub allow: Vec<String>,
+    #[serde(default)]
+    pub deny: Vec<String>,
     /// Default session command; `None` = login shell.
     pub command: Option<Vec<String>>,
     pub term: Option<String>,
@@ -74,6 +78,69 @@ pub struct NewPocket {
     /// Copy host agent config (`~/.claude`, `~/.codex`) in, secrets stripped.
     #[serde(default = "yes")]
     pub sync_config: bool,
+    /// Forward the host's ssh-agent, confirming every signature (opt-in).
+    #[serde(default)]
+    pub ssh_agent: bool,
+    #[serde(default = "yes")]
+    pub auto_forward: bool,
+    /// Fixed forwards `(guest, host)`.
+    #[serde(default)]
+    pub forward: Vec<(u16, u16)>,
+    /// Extra environment for every process in the pocket.
+    #[serde(default)]
+    pub env: Vec<(String, String)>,
+    #[serde(default)]
+    pub git_protected: Vec<String>,
+    #[serde(default)]
+    pub git_allow_push: Vec<String>,
+    /// `sandbox.setup` from pocket.toml: baked into a project template.
+    #[serde(default)]
+    pub setup: Option<Setup>,
+}
+
+/// A project setup step and the content hashes of its inputs (template key material).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Setup {
+    pub command: String,
+    /// `(path, sha256)` of each `setup_inputs` file.
+    pub inputs: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ApprovalWhat {
+    /// A blocked destination (from the proxy or `pocket-guest allow`).
+    Network {
+        host: String,
+        port: Option<u16>,
+        reason: String,
+    },
+    /// An ssh-agent signature request.
+    SshSign { key: String, comment: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalInfo {
+    pub id: u64,
+    pub pocket: String,
+    pub what: ApprovalWhat,
+    pub created_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Decision {
+    /// This request (network: for two minutes).
+    Once,
+    /// Network: for the pocket's lifetime.
+    Pocket,
+    Deny,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortInfo {
+    pub guest: u16,
+    pub host: u16,
+    pub process: Option<String>,
+    pub auto: bool,
 }
 
 fn yes() -> bool {
@@ -113,6 +180,7 @@ pub struct SecretAdd {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(clippy::large_enum_variant)]
 pub enum Request {
     NewPocket(NewPocket),
     List,
@@ -195,6 +263,36 @@ pub enum Request {
         pocket: String,
         rebase: bool,
     },
+    Approvals {
+        pocket: Option<String>,
+    },
+    Approve {
+        id: u64,
+        decision: Decision,
+    },
+    /// Allows destinations (`once` = for two minutes) and resolves matching approvals.
+    NetAllow {
+        pocket: String,
+        hosts: Vec<String>,
+        once: bool,
+    },
+    NetDeny {
+        pocket: String,
+        hosts: Vec<String>,
+    },
+    Ports {
+        pocket: String,
+    },
+    PortAdd {
+        pocket: String,
+        guest: u16,
+        host: Option<u16>,
+    },
+    /// An image pasted in `pocket attach`, offered to the guest's clipboard shims.
+    PasteImage {
+        pocket: String,
+        data: Vec<u8>,
+    },
     SecretAdd(SecretAdd),
     SecretList,
     SecretRemove {
@@ -239,6 +337,8 @@ pub enum Response {
     Secret(SecretInfo),
     Secrets(Vec<SecretInfo>),
     ConfigChanges(Vec<ConfigChange>),
+    Approvals(Vec<ApprovalInfo>),
+    Ports(Vec<PortInfo>),
     /// Human-readable result (diff text, apply summary, PR URL …) plus structured fields.
     Text {
         text: String,
@@ -364,6 +464,38 @@ pub enum Event {
         session: String,
         status: ExitStatus,
     },
+    Port {
+        pocket: String,
+        port: PortInfo,
+        open: bool,
+    },
+    Approval(ApprovalInfo),
+    ApprovalDone {
+        id: u64,
+        pocket: String,
+        decision: Decision,
+    },
+    /// Something for the user's attention: `kind` is `notify`, `bell` or `url`.
+    Notice {
+        pocket: String,
+        session: Option<String>,
+        kind: String,
+        title: String,
+        body: String,
+    },
+}
+
+impl Event {
+    pub fn topic(&self) -> Topic {
+        match self {
+            Event::Net(_) => Topic::Net,
+            Event::Port { .. }
+            | Event::Approval(_)
+            | Event::ApprovalDone { .. }
+            | Event::Notice { .. } => Topic::Notices,
+            _ => Topic::Pockets,
+        }
+    }
 }
 
 /// Stable error codes; each maps to a documented CLI exit code (CLI.md §Exit codes).
@@ -497,11 +629,19 @@ mod tests {
                     disk_mib: None,
                     net_profile: Some("dev".into()),
                     allow: vec!["x.com".into()],
+                    deny: vec![],
                     command: None,
                     term: Some("xterm".into()),
                     secrets: None,
                     copy_secrets: vec![],
                     sync_config: true,
+                    ssh_agent: false,
+                    auto_forward: true,
+                    forward: vec![],
+                    env: vec![],
+                    git_protected: vec![],
+                    git_allow_push: vec![],
+                    setup: None,
                 }),
             },
             ClientMsg::Subscribe {

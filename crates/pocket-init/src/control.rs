@@ -130,6 +130,15 @@ fn handle(id: u64, req: HostReq) -> Result<Reply, GuestError> {
                 .unwrap_or_else(|e| e.into_inner()) = env;
             netshim::start(proxy_port).map_err(io_err("proxy shim"))?;
             crate::ports::start_watcher(vec![proxy_port]);
+            crate::guestsock::start();
+            if process::GLOBAL_ENV
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .any(|(k, v)| k == "SSH_AUTH_SOCK" && v == crate::guestsock::AGENT_SOCK)
+            {
+                crate::guestsock::start_agent();
+            }
             Ok(Reply::Done)
         }
         HostReq::Exec {

@@ -5,6 +5,7 @@ mod daemon;
 mod doctor;
 mod guard;
 mod guest;
+mod host;
 mod inject;
 mod net;
 mod paths;
@@ -13,6 +14,7 @@ mod provision;
 mod review;
 mod rpc;
 mod secrets;
+mod sshagent;
 mod workspace;
 
 use std::os::fd::AsRawFd;

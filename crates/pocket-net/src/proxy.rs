@@ -61,6 +61,9 @@ impl Connector for TcpConnector {
     }
 }
 
+/// `(host, port, reason)` of a destination the policy blocked.
+pub type BlockHook = Box<dyn Fn(&str, u16, &str) + Send + Sync>;
+
 pub struct ProxyCtx {
     pub pocket: String,
     pub policy: RwLock<Policy>,
@@ -69,6 +72,16 @@ pub struct ProxyCtx {
     pub log: Box<dyn Fn(NetEntry) + Send + Sync>,
     /// TLS interception for the destinations its hooks claim; `None` = pass-through only.
     pub mitm: Option<Arc<crate::mitm::Mitm>>,
+    /// Called when the policy (not an always-denied range) blocks `host:port`.
+    pub on_block: Option<BlockHook>,
+}
+
+impl ProxyCtx {
+    fn blocked(&self, host: &str, port: u16, why: &str) {
+        if let Some(f) = &self.on_block {
+            f(host, port, why);
+        }
+    }
 }
 
 fn now_ms() -> u64 {
@@ -347,6 +360,7 @@ where
     o.entry.method = Some("CONNECT".into());
     let decision = ctx.policy.read().unwrap().decide(&host, port);
     if let Err(why) = decision {
+        ctx.blocked(&host, port, &why);
         o.entry.reason = why.clone();
         respond(
             guest,
@@ -729,6 +743,7 @@ where
     };
     let decision = ctx.policy.read().unwrap().decide(&host, port);
     if let Err(why) = decision {
+        ctx.blocked(&host, port, &why);
         deny(&mut o, why.clone());
         respond(
             guest,

@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use pocket_proto::rpc::{
-    self, ClientMsg, DaemonMsg, ErrorCode, Event, RPC_VERSION, Request, Response, RpcError, Topic,
+    self, ClientMsg, DaemonMsg, ErrorCode, RPC_VERSION, Request, Response, RpcError,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
@@ -114,10 +114,7 @@ async fn connection(
                     loop {
                         match ev.recv().await {
                             Ok((seq, event)) => {
-                                let wanted = match &event {
-                                    Event::Net(_) => topics.contains(&Topic::Net),
-                                    _ => topics.contains(&Topic::Pockets),
-                                };
+                                let wanted = topics.contains(&event.topic());
                                 if wanted && tx.send(DaemonMsg::Event { seq, event }).is_err() {
                                     break;
                                 }
@@ -263,6 +260,69 @@ async fn handle(
         Request::ConfigPull { pocket, accept } => {
             Response::ConfigChanges(crate::agentcfg::pull(d, &pocket, accept).await?)
         }
+        Request::Approvals { pocket } => {
+            let pocket = match pocket {
+                Some(p) => Some(d.find(&p)?.info.name),
+                None => None,
+            };
+            Response::Approvals(d.approvals_for(pocket.as_deref()))
+        }
+        Request::Approve { id, decision } => {
+            d.approve(id, decision).await?;
+            Response::Done
+        }
+        Request::NetAllow {
+            pocket,
+            hosts,
+            once,
+        } => {
+            d.net_allow(&pocket, &hosts, once).await?;
+            Response::Done
+        }
+        Request::NetDeny { pocket, hosts } => {
+            d.net_deny(&pocket, &hosts).await?;
+            Response::Done
+        }
+        Request::Ports { pocket } => {
+            let rec = d.find(&pocket)?;
+            let live = d.live(&rec.info.id).ok_or_else(|| {
+                err(
+                    ErrorCode::InvalidState,
+                    format!("pocket {} is not running", rec.info.name),
+                )
+            })?;
+            Response::Ports(
+                live.host
+                    .ports
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .map(|f| f.info.clone())
+                    .collect(),
+            )
+        }
+        Request::PortAdd {
+            pocket,
+            guest,
+            host,
+        } => {
+            let rec = d.find(&pocket)?;
+            let live = d.live(&rec.info.id).ok_or_else(|| {
+                err(
+                    ErrorCode::InvalidState,
+                    format!("pocket {} is not running", rec.info.name),
+                )
+            })?;
+            if guest == 0 || host == Some(0) {
+                return Err(err(ErrorCode::BadRequest, "port 0"));
+            }
+            let info = d.forward_port(&live, guest, host, None, false).await?;
+            Response::Ports(vec![info])
+        }
+        Request::PasteImage { pocket, data } => Response::Text {
+            text: d.paste_image(&pocket, data).await?,
+            url: None,
+        },
         Request::SecretAdd(a) => Response::Secret(d.secret_add(a)?),
         Request::SecretList => Response::Secrets(
             d.db(|s| s.secrets())?

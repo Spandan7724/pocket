@@ -6,6 +6,8 @@ mod client;
 mod diff;
 mod error;
 mod exec;
+mod notice;
+mod project;
 mod secrets;
 mod term;
 mod vsock;
@@ -80,6 +82,18 @@ enum Cmd {
         /// Don't copy host agent config (~/.claude, ~/.codex) into the pocket.
         #[arg(long)]
         no_config: bool,
+        /// Forward the host's ssh-agent; every signature needs your approval.
+        #[arg(long)]
+        ssh_agent: bool,
+        /// Environment for every process in the pocket (KEY=VALUE, repeatable).
+        #[arg(long = "env", short = 'e')]
+        envs: Vec<String>,
+        /// Forward GUEST[:HOST] port (repeatable); other ports forward automatically.
+        #[arg(long = "forward", short = 'p')]
+        forwards: Vec<String>,
+        /// Don't forward ports automatically when guest programs listen.
+        #[arg(long)]
+        no_auto_forward: bool,
         /// Command for the default session instead of a login shell.
         #[arg(last = true)]
         command: Vec<String>,
@@ -174,6 +188,42 @@ enum Cmd {
         #[arg(long)]
         rebase: bool,
     },
+    /// Pending requests that need you: blocked destinations, ssh signatures.
+    Approvals { pocket: Option<String> },
+    /// Answer a pending request (default: allow once).
+    Approve {
+        id: u64,
+        /// Allow for the pocket's lifetime (network requests).
+        #[arg(long)]
+        pocket: bool,
+        #[arg(long)]
+        deny: bool,
+    },
+    /// Allow destinations for a pocket (host, *.domain, CIDR, optional :port).
+    Allow {
+        pocket: String,
+        #[arg(required = true)]
+        hosts: Vec<String>,
+        /// Only for the next two minutes.
+        #[arg(long)]
+        once: bool,
+        /// Also add them to the project's pocket.toml.
+        #[arg(long)]
+        project: bool,
+    },
+    /// Deny destinations for a pocket.
+    Deny {
+        pocket: String,
+        #[arg(required = true)]
+        hosts: Vec<String>,
+    },
+    /// List port forwards, or forward GUEST[:HOST].
+    Port {
+        pocket: String,
+        spec: Option<String>,
+    },
+    /// Open a forwarded port in the host browser (default: the only/first one).
+    Open { pocket: String, port: Option<u16> },
     /// Show a pocket's network log.
     Logs {
         pocket: String,
@@ -211,6 +261,12 @@ enum Cmd {
     },
     /// Check this host and suggest fixes.
     Doctor,
+    /// Write a pocket.toml for the current repository (detects the toolchain).
+    Init {
+        /// Overwrite an existing pocket.toml.
+        #[arg(long, short)]
+        force: bool,
+    },
     /// Manage the daemon.
     Daemon {
         #[command(subcommand)]
@@ -515,6 +571,36 @@ fn run(cli: Cli) -> Result<u8> {
             );
             Ok(if ok { 0 } else { 1 })
         }
+        Cmd::Init { force } => {
+            let cwd = std::env::current_dir().map_err(|e| CliError::io("current directory", e))?;
+            let root = repo_root(&cwd).unwrap_or(cwd);
+            let path = root.join(project::FILE);
+            if path.exists() && !force {
+                return Err(CliError::new(
+                    "already_exists",
+                    4,
+                    format!("{} exists", path.display()),
+                )
+                .hint("edit it, or rerun with --force to replace it"));
+            }
+            let (text, found) = project::detect(&root);
+            std::fs::write(&path, &text)
+                .map_err(|e| CliError::io(&path.display().to_string(), e))?;
+            if j {
+                println!("{}", serde_json::json!({ "path": path, "detected": found }));
+            } else {
+                println!(
+                    "wrote {} ({})\nnext: review it, commit it, then `pocket new`",
+                    path.display(),
+                    if found.is_empty() {
+                        "no toolchain detected".into()
+                    } else {
+                        format!("detected {}", found.join(", "))
+                    }
+                );
+            }
+            Ok(0)
+        }
         Cmd::Daemon { cmd } => match cmd {
             DaemonCmd::Stop => {
                 if let Some(mut c) = Client::connect_existing() {
@@ -569,8 +655,24 @@ fn command(c: &mut Client, cmd: Cmd, j: bool) -> Result<u8> {
             no_secrets,
             copy_secrets,
             no_config,
+            ssh_agent,
+            envs,
+            forwards,
+            no_auto_forward,
             command,
         } => {
+            let flag_secrets = no_secrets || !secrets.is_empty();
+            let mut env = vec![];
+            for e in envs {
+                let (k, v) = e
+                    .split_once('=')
+                    .ok_or_else(|| CliError::usage(format!("--env {e:?}: use KEY=VALUE")))?;
+                env.push((k.to_string(), v.to_string()));
+            }
+            let mut forward = vec![];
+            for f in forwards {
+                forward.push(parse_forward(&f)?);
+            }
             if !copy_secrets.is_empty() {
                 eprintln!(
                     "warning: --copy-secret puts the real value of {} inside the pocket, where any code can read and send it",
@@ -603,6 +705,7 @@ fn command(c: &mut Client, cmd: Cmd, j: bool) -> Result<u8> {
                 disk_mib: disk.as_deref().map(parse_size_mib).transpose()?,
                 net_profile: net,
                 allow,
+                deny: vec![],
                 command: (!command.is_empty()).then_some(command),
                 term: std::env::var("TERM").ok(),
                 secrets: if no_secrets {
@@ -612,7 +715,26 @@ fn command(c: &mut Client, cmd: Cmd, j: bool) -> Result<u8> {
                 },
                 copy_secrets,
                 sync_config: !no_config,
+                ssh_agent,
+                auto_forward: !no_auto_forward,
+                forward,
+                env,
+                git_protected: vec![],
+                git_allow_push: vec![],
+                setup: None,
             };
+            let mut req = req;
+            if let Some(repo) = req.repo.clone()
+                && let Some((path, p)) = project::load(&repo)?
+            {
+                project::apply(&p, &repo, &mut req, flag_secrets)?;
+                if !j {
+                    eprintln!("· using {}", path.display());
+                    for n in &p.notes {
+                        eprintln!("  note: {n}");
+                    }
+                }
+            }
             let started = std::time::Instant::now();
             let r = c.request_with(Request::NewPocket(req), progress_printer(j));
             end_progress();
@@ -939,6 +1061,143 @@ fn command(c: &mut Client, cmd: Cmd, j: bool) -> Result<u8> {
             let p = resolve_pocket(c, &pocket)?;
             text_reply(c.request(Request::Sync { pocket: p, rebase })?, j)
         }
+        Cmd::Approvals { pocket } => {
+            let pocket = pocket.map(|p| resolve_pocket(c, &p)).transpose()?;
+            let Response::Approvals(list) = c.request(Request::Approvals { pocket })? else {
+                return Err(CliError::new("internal", 70, "unexpected reply"));
+            };
+            if j {
+                json(&list);
+            } else if list.is_empty() {
+                println!("nothing is waiting for you");
+            } else {
+                println!("{:>5}  {:<20} REQUEST", "ID", "POCKET");
+                for a in &list {
+                    println!("{:>5}  {:<20} {}", a.id, a.pocket, describe_approval(a));
+                }
+                println!("\nanswer with `pocket approve ID [--pocket|--deny]`");
+            }
+            Ok(0)
+        }
+        Cmd::Approve { id, pocket, deny } => {
+            let decision = if deny {
+                pocket_proto::rpc::Decision::Deny
+            } else if pocket {
+                pocket_proto::rpc::Decision::Pocket
+            } else {
+                pocket_proto::rpc::Decision::Once
+            };
+            c.request(Request::Approve { id, decision })?;
+            if !j {
+                println!("{} request {id}", if deny { "denied" } else { "approved" });
+            }
+            Ok(0)
+        }
+        Cmd::Allow {
+            pocket,
+            hosts,
+            once,
+            project,
+        } => {
+            let p = resolve_pocket(c, &pocket)?;
+            c.request(Request::NetAllow {
+                pocket: p.clone(),
+                hosts: hosts.clone(),
+                once,
+            })?;
+            if project {
+                let path = project::allow_in_project(c, &p, &hosts)?;
+                if !j {
+                    println!("added {} to {}", hosts.join(", "), path.display());
+                }
+            }
+            if !j {
+                println!(
+                    "allowed {} for {p}{}",
+                    hosts.join(", "),
+                    if once { " (two minutes)" } else { "" }
+                );
+            }
+            Ok(0)
+        }
+        Cmd::Deny { pocket, hosts } => {
+            let p = resolve_pocket(c, &pocket)?;
+            c.request(Request::NetDeny {
+                pocket: p.clone(),
+                hosts: hosts.clone(),
+            })?;
+            if !j {
+                println!("denied {} for {p}", hosts.join(", "));
+            }
+            Ok(0)
+        }
+        Cmd::Port { pocket, spec } => {
+            let p = resolve_pocket(c, &pocket)?;
+            let r = match spec {
+                Some(s) => {
+                    let (g, h) = parse_forward(&s)?;
+                    c.request(Request::PortAdd {
+                        pocket: p,
+                        guest: g,
+                        host: s.contains(':').then_some(h),
+                    })?
+                }
+                None => c.request(Request::Ports { pocket: p })?,
+            };
+            let Response::Ports(list) = r else {
+                return Err(CliError::new("internal", 70, "unexpected reply"));
+            };
+            if j {
+                json(&list);
+            } else if list.is_empty() {
+                println!(
+                    "no forwarded ports — programs listening in the pocket are forwarded automatically"
+                );
+            } else {
+                println!("{:>6}  {:<22} {:<6} PROCESS", "GUEST", "HOST", "AUTO");
+                for f in list {
+                    println!(
+                        "{:>6}  127.0.0.1:{:<12} {:<6} {}",
+                        f.guest,
+                        f.host,
+                        if f.auto { "yes" } else { "no" },
+                        f.process.unwrap_or_default()
+                    );
+                }
+            }
+            Ok(0)
+        }
+        Cmd::Open { pocket, port } => {
+            let p = resolve_pocket(c, &pocket)?;
+            let Response::Ports(list) = c.request(Request::Ports { pocket: p.clone() })? else {
+                return Err(CliError::new("internal", 70, "unexpected reply"));
+            };
+            let f = match port {
+                Some(g) => list.iter().find(|f| f.guest == g),
+                None => list.first(),
+            }
+            .ok_or_else(|| {
+                CliError::new(
+                    "not_found",
+                    3,
+                    format!(
+                        "no forwarded port{} in {p}",
+                        port.map(|x| format!(" {x}")).unwrap_or_default()
+                    ),
+                )
+                .hint(format!(
+                    "`pocket port {p}` lists forwards; start a server in the pocket first"
+                ))
+            })?;
+            let url = format!("http://127.0.0.1:{}/", f.host);
+            open_browser(&url)?;
+            if j {
+                println!("{}", serde_json::json!({ "url": url }));
+            } else {
+                println!("opened {url} (guest port {})", f.guest);
+            }
+            Ok(0)
+        }
         Cmd::Login {
             provider,
             name,
@@ -949,8 +1208,48 @@ fn command(c: &mut Client, cmd: Cmd, j: bool) -> Result<u8> {
         Cmd::Config {
             cmd: ConfigCmd::Pull { pocket, yes },
         } => config_pull(c, &pocket, yes, j),
-        Cmd::Doctor | Cmd::Daemon { .. } => unreachable!(),
+        Cmd::Doctor | Cmd::Daemon { .. } | Cmd::Init { .. } => unreachable!(),
     }
+}
+
+/// `GUEST[:HOST]`.
+fn parse_forward(s: &str) -> Result<(u16, u16)> {
+    let bad = || {
+        CliError::usage(format!("invalid port forward {s:?}"))
+            .hint("use GUEST or GUEST:HOST, e.g. 5173 or 3000:8080")
+    };
+    let (g, h) = s.split_once(':').unwrap_or((s, s));
+    let g: u16 = g.parse().map_err(|_| bad())?;
+    let h: u16 = h.parse().map_err(|_| bad())?;
+    if g == 0 || h == 0 {
+        return Err(bad());
+    }
+    Ok((g, h))
+}
+
+fn describe_approval(a: &pocket_proto::rpc::ApprovalInfo) -> String {
+    match &a.what {
+        pocket_proto::rpc::ApprovalWhat::Network { host, port, reason } => format!(
+            "network  {}{}  ({reason})",
+            host,
+            port.map(|p| format!(":{p}")).unwrap_or_default()
+        ),
+        pocket_proto::rpc::ApprovalWhat::SshSign { key, comment } => {
+            format!("ssh sign  key {key} {comment}")
+        }
+    }
+}
+
+fn open_browser(url: &str) -> Result<()> {
+    let cmd = std::env::var("POCKET_OPEN_CMD").unwrap_or_else(|_| "xdg-open".into());
+    std::process::Command::new(&cmd)
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| CliError::io(&format!("run {cmd}"), e).hint(format!("open {url} yourself")))
 }
 
 fn text_reply(r: Response, j: bool) -> Result<u8> {

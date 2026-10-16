@@ -100,9 +100,9 @@ pub struct Live {
     pub vm: VmHandle,
     pub guest: Arc<GuestConn>,
     pub user: Option<String>,
-    #[expect(dead_code, reason = "network approvals (M8) edit the live policy")]
     pub proxy: Arc<pocket_net::proxy::ProxyCtx>,
     pub hooks: Arc<PocketHooks>,
+    pub host: crate::host::HostState,
     pub stopping: AtomicBool,
     pub tasks: Mutex<Vec<JoinHandle<()>>>,
 }
@@ -124,6 +124,8 @@ pub struct Daemon {
     pub events: broadcast::Sender<(u64, Event)>,
     seq: AtomicU64,
     pub vault: secrets::Vault,
+    pub approvals: Mutex<Vec<crate::host::Pending>>,
+    approval_seq: AtomicU64,
     ca: Mutex<Option<Arc<pocket_net::ca::Ca>>>,
     tls: std::sync::OnceLock<Arc<rustls::ClientConfig>>,
 }
@@ -152,6 +154,23 @@ pub struct Meta {
     pub git_protected: Vec<String>,
     #[serde(default)]
     pub git_allow_push: Vec<String>,
+    #[serde(default)]
+    pub deny: Vec<String>,
+    #[serde(default)]
+    pub ssh_agent: bool,
+    #[serde(default = "yes")]
+    pub auto_forward: bool,
+    #[serde(default)]
+    pub forward: Vec<(u16, u16)>,
+    #[serde(default)]
+    pub env: Vec<(String, String)>,
+    /// Project template the pocket disk came from (`sandbox.setup`).
+    #[serde(default)]
+    pub template: Option<String>,
+}
+
+fn yes() -> bool {
+    true
 }
 
 impl Daemon {
@@ -166,9 +185,15 @@ impl Daemon {
             events: broadcast::channel(4096).0,
             seq: AtomicU64::new(1),
             vault: secrets::Vault::new(secrets::choose_backend(&paths_data)),
+            approvals: Mutex::new(vec![]),
+            approval_seq: AtomicU64::new(1),
             ca: Mutex::new(None),
             tls: std::sync::OnceLock::new(),
         })
+    }
+
+    pub fn next_approval(&self) -> u64 {
+        self.approval_seq.fetch_add(1, Ordering::Relaxed)
     }
 
     pub fn ca(&self) -> R<Arc<pocket_net::ca::Ca>> {
@@ -400,6 +425,10 @@ impl Daemon {
         };
         let profile = req.net_profile.clone().unwrap_or_else(|| "dev".into());
         net::policy_for(&profile, &req.allow)?;
+        for d in &req.deny {
+            pocket_net::policy::Rule::parse(d)
+                .map_err(|e| err(ErrorCode::BadRequest, e.to_string()))?;
+        }
         let injected = self.select_secrets(&req)?;
         let name = self.pick_name(&req, repo.as_ref().map(|r| r.toplevel.as_path()))?;
         let id = hex(&random_bytes(8));
@@ -436,6 +465,13 @@ impl Daemon {
                 allow: req.allow.clone(),
                 secrets: injected,
                 sync_config: req.sync_config,
+                ssh_agent: req.ssh_agent,
+                auto_forward: req.auto_forward,
+                forward: req.forward.clone(),
+                env: req.env.clone(),
+                git_protected: req.git_protected.clone(),
+                git_allow_push: req.git_allow_push.clone(),
+                deny: req.deny.clone(),
                 base_branch: repo.as_ref().and_then(|r| r.branch.clone()),
                 origin_host: repo
                     .as_ref()
@@ -579,6 +615,7 @@ impl Daemon {
         let vsock_uds = rt.join("vsock.sock");
         let (proxy, hooks) = self.egress(rec)?;
         let mut tasks = net::listen(self, rec, &vsock_uds, proxy.clone())?;
+        self.agent_listener(rec, &vsock_uds, &mut tasks)?;
         let vm = self.backend.create(&spec).await.map_err(|e| {
             err(ErrorCode::Vmm, e.to_string()).hint(format!("see {}", spec.log_path.display()))
         })?;
@@ -622,6 +659,11 @@ impl Daemon {
         if configure {
             let mut env = proxy_env();
             env.extend(provision::guest_env(&hooks));
+            if meta.ssh_agent {
+                env.push(("SSH_AUTH_SOCK".into(), "/run/pocket/ssh-agent.sock".into()));
+            }
+            env.push(("BROWSER".into(), "pocket-guest open".into()));
+            env.extend(meta.env.iter().cloned());
             guest
                 .request(HostReq::Configure {
                     hostname: rec.info.name.clone(),
@@ -658,6 +700,8 @@ impl Daemon {
                 s.set_meta(&rec.info.id, &mj)
             })?;
         }
+        let auto_forward = meta.auto_forward;
+        let fixed = meta.forward.clone();
         let live = Arc::new(Live {
             id: rec.info.id.clone(),
             name: rec.info.name.clone(),
@@ -666,11 +710,13 @@ impl Daemon {
             user: meta.user,
             proxy,
             hooks,
+            host: crate::host::HostState::new(auto_forward),
             stopping: AtomicBool::new(false),
             tasks: Mutex::new(std::mem::take(tasks)),
         });
         let d = self.clone();
         let pname = rec.info.name.clone();
+        let weak = Arc::downgrade(&live);
         live.tasks.lock().unwrap().push(tokio::spawn(async move {
             while let Some(e) = rx.recv().await {
                 if let GuestEvent::SessionExited { name, status } = e {
@@ -679,9 +725,16 @@ impl Daemon {
                         session: name,
                         status,
                     });
+                } else if let Some(l) = weak.upgrade() {
+                    d.guest_event(&l, e).await;
                 }
             }
         }));
+        for (g, h) in fixed {
+            if let Err(e) = self.forward_port(&live, g, Some(h), None, false).await {
+                tracing::warn!("{}: forward {g}:{h}: {}", rec.info.name, e.message);
+            }
+        }
         self.live
             .lock()
             .unwrap()
@@ -755,6 +808,7 @@ impl Daemon {
                     .map_err(|e| err(ErrorCode::Vmm, e.to_string()))?;
                 let (proxy, hooks) = self.egress(&rec)?;
                 let mut tasks = net::listen(self, &rec, &vm.vsock_uds, proxy.clone())?;
+                self.agent_listener(&rec, &vm.vsock_uds, &mut tasks)?;
                 self.attach_guest(&rec, vm, proxy, hooks, &mut tasks, false)
                     .await
             }
@@ -824,6 +878,28 @@ impl Daemon {
         Ok(out)
     }
 
+    fn agent_listener(
+        self: &Arc<Self>,
+        rec: &PocketRecord,
+        vsock_uds: &Path,
+        tasks: &mut Vec<JoinHandle<()>>,
+    ) -> R<()> {
+        if !Self::meta(rec).ssh_agent {
+            return Ok(());
+        }
+        let path =
+            pocket_vmm::vsock::host_listener_path(vsock_uds, pocket_proto::guest::SSH_AGENT_PORT);
+        tasks.push(
+            crate::sshagent::listen(self, &rec.info.name, &path).map_err(|e| {
+                err(
+                    ErrorCode::HostSetup,
+                    format!("listen on {}: {e}", path.display()),
+                )
+            })?,
+        );
+        Ok(())
+    }
+
     /// The pocket's proxy context with its interception hooks.
     fn egress(
         self: &Arc<Self>,
@@ -883,6 +959,11 @@ impl Daemon {
             hooks: hooks.clone(),
         });
         let proxy = net::proxy_ctx(self, rec, &meta.allow, Some(mitm))?;
+        for d in &meta.deny {
+            if let Ok(r) = pocket_net::policy::Rule::parse(d) {
+                proxy.policy.write().unwrap().deny.push(r);
+            }
+        }
         Ok((proxy, hooks))
     }
 

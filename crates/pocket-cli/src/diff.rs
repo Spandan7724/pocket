@@ -30,7 +30,7 @@ pub fn unified(a: &str, b: &str, ctx: usize) -> String {
             ops.push((' ', a[i]));
             i += 1;
             j += 1;
-        } else if j < m && (i == n || t[i][j + 1] >= t[i + 1][j]) {
+        } else if j < m && (i == n || t[i][j + 1] > t[i + 1][j]) {
             ops.push(('+', b[j]));
             j += 1;
         } else {
