@@ -74,8 +74,10 @@ jobs:
             ${{ env.POCKET_BUILD_DIR }}/tools
           key: assets-${{ runner.os }}-${{ hashFiles('guest/kernel/**', 'xtask/src/kernel.rs', 'xtask/src/assets.rs') }}
 
+      # Restored here, saved even when a later step fails: building `base` takes ~20 min.
       - name: Preset image cache
-        uses: actions/cache@v6
+        id: presets
+        uses: actions/cache/restore@v6
         with:
           path: ${{ env.POCKET_BUILD_DIR }}/presets
           key: presets-${{ runner.os }}-${{ hashFiles('guest/presets/**', 'crates/pocketd/src/presets.rs') }}
@@ -88,6 +90,13 @@ jobs:
           POCKET_KVM_TESTS: require
           POCKET_CI_FUZZ: require
         run: cargo xtask ci
+
+      - name: Save preset images
+        if: always() && steps.presets.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ env.POCKET_BUILD_DIR }}/presets
+          key: ${{ steps.presets.outputs.cache-primary-key }}
 
   aarch64:
     # Hosted arm64 runners have no /dev/kvm (D14): build and unit tests only.

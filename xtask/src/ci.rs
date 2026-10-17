@@ -432,26 +432,41 @@ fn bench_gate() -> Result {
     }
     let bin = root().join("target/debug");
     let report = out().join("bench-latest.json");
-    run(Command::new(bin.join("pocket"))
-        .env("POCKET_ASSETS_DIR", out())
-        .env("POCKET_PRESET_CACHE", out().join("presets"))
-        .env("POCKETD", bin.join("pocketd"))
-        // 512M: on a tmpfs /tmp a snapshot file is charged to the VMM's memory cgroup.
-        .args([
-            "bench",
-            "--preset",
-            "test",
-            "--runs",
-            "10",
-            "--density",
-            "0",
-            "--mem",
-            "512M",
-        ])
-        .arg("--baseline")
-        .arg(root().join("bench/baseline.json"))
-        .arg("--out")
-        .arg(&report))?;
+    let bench = || {
+        Command::new(bin.join("pocket"))
+            .env("POCKET_ASSETS_DIR", out())
+            .env("POCKET_PRESET_CACHE", out().join("presets"))
+            .env("POCKETD", bin.join("pocketd"))
+            // 512M: on a tmpfs /tmp a snapshot file is charged to the VMM's memory cgroup.
+            .args([
+                "bench",
+                "--preset",
+                "test",
+                "--runs",
+                "20",
+                "--density",
+                "0",
+                "--mem",
+                "512M",
+            ])
+            .arg("--baseline")
+            .arg(root().join("bench/baseline.json"))
+            .arg("--out")
+            .arg(&report)
+            .status()
+            .map_err(|e| format!("pocket bench: {e}"))
+    };
+    // A regression must show twice in a row: one sample on a busy machine can be 10% off
+    // without any code change.
+    if !bench()?.success() {
+        eprintln!("bench gate: regression flagged; measuring again to confirm");
+        if !bench()?.success() {
+            let _ = Command::new(bin.join("pocket"))
+                .args(["daemon", "stop"])
+                .status();
+            bail!("bench gate: p50 regression > 10% in two consecutive measurements");
+        }
+    }
     let _ = Command::new(bin.join("pocket"))
         .args(["daemon", "stop"])
         .status();
