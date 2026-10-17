@@ -116,7 +116,10 @@ impl Env {
             .env("HOME", self.root.join("home"))
             .env("POCKET_ASSETS_DIR", &self.assets)
             .env("POCKETD", bin_dir().join("pocketd"))
-            .env_remove("TERM");
+            .env_remove("TERM")
+            // The developer's terminal (kitty, Ghostty…) must not leak its terminfo in.
+            .env_remove("TERMINFO")
+            .env_remove("TERMINFO_DIRS");
         for (k, v) in &self.extra {
             c.env(k, v);
         }

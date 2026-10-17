@@ -47,14 +47,14 @@ fn terminal_matrix() {
         "--mem",
         "1G",
     ]);
-    // Like Ghostty: the terminal ships its own entry and points TERMINFO at it; neither the
-    // image nor the host's ncurses has one. pocket copies the client's entry in.
+    // kitty and Ghostty ship their own terminfo entries and point TERMINFO at them; Ubuntu's
+    // image has neither. pocket installs the client's entry (stand-ins compiled here).
     let ti = env.root.join("terminfo");
     std::fs::create_dir_all(&ti).unwrap();
-    let src = env.root.join("ghostty.src");
+    let src = env.root.join("own.src");
     std::fs::write(
         &src,
-        "xterm-ghostty|ghostty (test entry),\n\tuse=xterm-256color,\n",
+        "xterm-ghostty|ghostty (test entry),\n\tuse=xterm-256color,\nxterm-kitty|kitty (test entry),\n\tuse=xterm-256color,\n",
     )
     .unwrap();
     let st = std::process::Command::new("tic")
