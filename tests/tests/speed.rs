@@ -256,7 +256,10 @@ fn warm_pool_claims_refills_and_respects_its_memory_cap() {
         .next_back()
         .expect("claim latency logged");
     eprintln!("pool claim → ready {claim:.2} ms; pocket new end-to-end {e2e:?}");
-    assert!(claim < 15.0, "pool claim took {claim} ms");
+    // The latency target (p50 ≤ 5 / p95 ≤ 15 ms) is `pocket bench`'s job and gated on a
+    // known machine; one sample on a shared CI runner (nested virtualization) is not a
+    // measurement. Here: a claim is a resume, not a restore or boot.
+    assert!(claim < 150.0, "pool claim took {claim} ms");
     let v = env.wait_templates("the pool refill", Duration::from_secs(30), |v| {
         v["pool"]["ready"].as_u64() == Some(1) && v["pool"]["claimed"].as_u64() == Some(1)
     });
