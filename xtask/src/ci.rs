@@ -436,6 +436,7 @@ fn bench_gate() -> Result {
         .env("POCKET_ASSETS_DIR", out())
         .env("POCKET_PRESET_CACHE", out().join("presets"))
         .env("POCKETD", bin.join("pocketd"))
+        // 512M: on a tmpfs /tmp a snapshot file is charged to the VMM's memory cgroup.
         .args([
             "bench",
             "--preset",
@@ -444,6 +445,8 @@ fn bench_gate() -> Result {
             "10",
             "--density",
             "0",
+            "--mem",
+            "512M",
         ])
         .arg("--baseline")
         .arg(root().join("bench/baseline.json"))
