@@ -1,0 +1,36 @@
+---
+source: crates/pocket-tui/tests/views.rs
+expression: "scenes::text(&buf)"
+---
+ pocket                                4 pockets · 4 sessions · ○ 1 need input · 6.0G of 31G RAM reserved · ↑37 req/min
+╭ POCKETS ──────────────────────────────────╮╭ webapp-1 ─ [1 Session]  2 Diff   3 Network   4 Ports   5 Info  ─────────╮
+│▶ api-fix            ‖ paused              ││ claude ● working  100×30  claude  INTERACT · Ctrl-] leaves              │
+│▼ netlab             ● running    ⚠net     ││✻ Claude Code                                                            │
+│  └ build            ✓ exit 0              ││                                                                         │
+│▶ scratch            ◌ hibernated          ││> Add rate limiting to the /login route                                  │
+│▼ webapp-1           ● running    ○1       ││                                                                         │
+│  ├ claude           ● working             ││● I'll add a token bucket in src/middleware/ratelimit.ts.                │
+│  ├ codex            ○ input needed        ││                                                                         │
+│  └ shell            · idle ⇄1             ││⎿ Wrote 48 lines to src/middleware/ratelimit.ts                          │
+│                                           ││⎿ Updated src/routes/login.ts (+3 -1)                                    │
+│                                           ││                                                                         │
+│                                           ││● Running the tests…                                                     │
+│                                           ││npm test -- login                                                        │
+│                                           ││✓ 14 passed                                                              │
+│                                           ││                                                                         │
+│                                           ││✻ Thinking… (12s · esc to interrupt)                                     │
+│                                           ││                                                                         │
+│                                           ││                                                                         │
+│                                           ││                                                                         │
+│                                           ││                                                                         │
+│                                           ││                                                                         │
+│                                           ││                                                                         │
+│                                           ││                                                                         │
+│                                           ││                                                                         │
+│                                           ││                                                                         │
+│                                           ││                                                                         │
+│                                           ││                                                                         │
+│                                           ││                                                                         │
+│                                           ││                                                                         │
+╰───────────────────────────────────────────╯╰─────────────────────────────────────────────────────────────────────────╯
+ Ctrl-] back to the dashboard

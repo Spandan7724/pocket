@@ -1,0 +1,36 @@
+---
+source: crates/pocket-tui/tests/views.rs
+expression: "scenes::text(&buf)"
+---
+ pocket                                4 pockets · 4 sessions · ○ 1 need input · 6.0G of 31G RAM reserved · ↑37 req/min
+╭ POCKETS ──────────────────────────────────╮╭ webapp-1 ─  1 Session   2 Diff  [3 Network]  4 Ports   5 Info  ─────────╮
+│▶ api-fix            ‖ paused              ││ ⚠ wants cdn.jsdelivr.net:443 — not in the dev profile                   │
+│▼ netlab             ● running    ⚠net     ││   o allow once  A allow for the pocket  D deny                          │
+│  └ build            ✓ exit 0              ││                                                                         │
+│▶ scratch            ◌ hibernated          ││ TIME     VERDICT    DESTINATION                        REQUEST          │
+│▼ webapp-1           ● running    ○1       ││ 05:06:31 ✓ allowed  github.com:443                     POST /o/r.git/git│
+│  ├ claude           ● working             ││ 05:06:10 ✗ blocked  cdn.jsdelivr.net:443               connect          │
+│  ├ codex            ○ input needed        ││ 05:05:40 ✓ allowed  registry.npmjs.org:443             connect          │
+│  └ shell            · idle ⇄1             ││ 05:06:36 ✓ allowed  api.anthropic.com:443              POST /v1/messages│
+│                                           ││                                                                         │
+│                                           ││                                                                         │
+│                                           ││                                                                         │
+│                                           ││                                                                         │
+│                                           ││                                                                         │
+│                                           ││                                                                         │
+│                                           ││                                                                         │
+│                                           ││                                                                         │
+│                                           ││                                                                         │
+│                                           ││                                                                         │
+│                                           ││                                                                         │
+│                                           ││                                                                         │
+│                                           ││                                                                         │
+│                                           ││                                                                         │
+│                                           ││                                                                         │
+│                                           ││                                                                         │
+│                                           ││                                                                         │
+│                                           ││                                                                         │
+│                                           ││                                                                         │
+│                                           ││                                                                         │
+╰───────────────────────────────────────────╯╰─────────────────────────────────────────────────────────────────────────╯
+ ⏎ attach · n new · t shell · o/A/D approve · p pause · x remove · g grid · / filter · : commands · ? help

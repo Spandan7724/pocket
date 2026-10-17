@@ -4,6 +4,7 @@
 mod attach;
 mod bench;
 mod client;
+mod dashboard;
 mod diff;
 mod error;
 mod exec;
@@ -35,8 +36,9 @@ struct Cli {
     /// Machine-readable output.
     #[arg(long, global = true)]
     json: bool,
+    /// Without a command: the dashboard.
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
 }
 
 #[derive(Subcommand)]
@@ -445,6 +447,39 @@ fn glyph(state: &str) -> &'static str {
     }
 }
 
+/// A `NewPocket` with every option at its default (scripts, bench, dashboard).
+fn default_new(name: Option<String>, preset: Option<String>, repo: Option<PathBuf>) -> NewPocket {
+    NewPocket {
+        name,
+        preset,
+        repo,
+        carry_changes: false,
+        cpus: None,
+        memory_mib: None,
+        disk_mib: None,
+        net_profile: None,
+        allow: vec![],
+        deny: vec![],
+        command: None,
+        term: std::env::var("TERM").ok(),
+        secrets: None,
+        copy_secrets: vec![],
+        sync_config: true,
+        ssh_agent: false,
+        auto_forward: true,
+        forward: vec![],
+        env: vec![],
+        git_protected: vec![],
+        git_allow_push: vec![],
+        setup: None,
+        share: vec![],
+        idle_pause_ms: None,
+        idle_hibernate_ms: None,
+        net_mode: None,
+        template: None,
+    }
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -585,7 +620,10 @@ fn confirm(question: &str) -> bool {
 
 fn run(cli: Cli) -> Result<u8> {
     let j = cli.json;
-    match cli.cmd {
+    let Some(cmd) = cli.cmd else {
+        return dashboard::run();
+    };
+    match cmd {
         Cmd::Doctor => {
             let checks = match Client::connect() {
                 Ok(mut c) => match c.request(Request::Doctor)? {
@@ -915,7 +953,11 @@ fn command(c: &mut Client, cmd: Cmd, j: bool) -> Result<u8> {
         }
         Cmd::Sessions { pocket } => {
             let p = resolve_pocket(c, &pocket)?;
-            let Response::Sessions(list) = c.request(Request::SessionList { pocket: p })? else {
+            let Response::Sessions(list) = c.request(Request::SessionList {
+                pocket: p,
+                peek: false,
+            })?
+            else {
                 return Err(CliError::new("internal", 70, "unexpected reply"));
             };
             let now = now_ms();
@@ -993,7 +1035,10 @@ fn command(c: &mut Client, cmd: Cmd, j: bool) -> Result<u8> {
             let s =
                 s.ok_or_else(|| CliError::usage("name the session: pocket kill POCKET:SESSION"))?;
             let p = resolve_pocket(c, &p)?;
-            let Response::Sessions(list) = c.request(Request::SessionList { pocket: p.clone() })?
+            let Response::Sessions(list) = c.request(Request::SessionList {
+                pocket: p.clone(),
+                peek: false,
+            })?
             else {
                 return Err(CliError::new("internal", 70, "unexpected reply"));
             };

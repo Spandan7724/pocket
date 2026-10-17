@@ -60,6 +60,56 @@ pub fn wrap(spec: &CgroupSpec, inner: &Command) -> Command {
     c
 }
 
+/// Moves the already running `pid` into a new scope with the limits applied: the call
+/// `systemd-run --scope` makes, issued with `busctl` so the VMM can start in parallel
+/// instead of after it (~15 ms on the start path). The caller waits for the child.
+pub fn adopt(spec: &CgroupSpec, pid: u32) -> std::io::Result<std::process::Child> {
+    let mut c = Command::new("busctl");
+    user_bus(&mut c);
+    c.args([
+        "--user",
+        "call",
+        "org.freedesktop.systemd1",
+        "/org/freedesktop/systemd1",
+        "org.freedesktop.systemd1.Manager",
+        "StartTransientUnit",
+        "ssa(sv)a(sa(sv))",
+    ])
+    .arg(format!("{}.scope", spec.unit))
+    .arg("fail")
+    .arg("6")
+    .args(["PIDs", "au", "1"])
+    .arg(pid.to_string())
+    .args(["Slice", "s"])
+    .arg(&spec.slice)
+    .args(["MemoryMax", "t"])
+    .arg(spec.memory_max_bytes.to_string())
+    .args(["CPUQuotaPerSecUSec", "t"])
+    .arg((spec.cpu_quota_pct as u64 * 10_000).to_string())
+    .args(["TasksMax", "t"])
+    .arg(spec.tasks_max.to_string())
+    .args(["CollectMode", "s", "inactive-or-failed"])
+    .arg("0")
+    .stdin(Stdio::null())
+    .stdout(Stdio::null())
+    .stderr(Stdio::piped())
+    .spawn()
+}
+
+/// Whether `busctl` can create scopes (cached); otherwise `wrap` is used.
+pub fn busctl_available() -> bool {
+    static OK: OnceLock<bool> = OnceLock::new();
+    *OK.get_or_init(|| {
+        user_bus(&mut Command::new("busctl"))
+            .args(["--user", "--version"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    })
+}
+
 pub fn stop_scope(unit: &str) {
     let _ = user_bus(&mut Command::new("systemctl"))
         .args(["--user", "stop", &format!("{unit}.scope")])

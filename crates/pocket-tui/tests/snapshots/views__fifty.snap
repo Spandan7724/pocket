@@ -1,0 +1,36 @@
+---
+source: crates/pocket-tui/tests/views.rs
+expression: "scenes::text(&buf)"
+---
+ pocket                                50 pockets · 40 sessions · ○ 7 need input · 60G of 31G RAM reserved · ↑0 req/min
+╭ POCKETS ──────────────────────────────────╮╭ agent-00 ─ [1 Session]  2 Diff   3 Network   4 Ports   5 Info  ─────────╮
+│▼ agent-00           ● running    ○1       ││ claude ○ input needed  100×30  claude                                   │
+│  ├ claude           ○ input needed        ││✻ Claude Code                                                            │
+│  └ shell            · idle                ││                                                                         │
+│▼ agent-01           ● running             ││> Add rate limiting to the /login route                                  │
+│  ├ claude           ● working             ││                                                                         │
+│  └ shell            · idle                ││● I'll add a token bucket in src/middleware/ratelimit.ts.                │
+│▶ agent-02           ‖ paused              ││                                                                         │
+│▶ agent-03           ◌ hibernated          ││⎿ Wrote 48 lines to src/middleware/ratelimit.ts                          │
+│▶ agent-04           ■ stopped             ││⎿ Updated src/routes/login.ts (+3 -1)                                    │
+│▼ agent-05           ● running             ││                                                                         │
+│  ├ claude           ● working             ││● Running the tests…                                                     │
+│  └ shell            · idle                ││npm test -- login                                                        │
+│▼ agent-06           ● running    ○1       ││✓ 14 passed                                                              │
+│  ├ claude           ○ input needed        ││                                                                         │
+│  └ shell            · idle                ││✻ Thinking… (12s · esc to interrupt)                                     │
+│▶ agent-07           ‖ paused              ││                                                                         │
+│▶ agent-08           ◌ hibernated          ││                                                                         │
+│▶ agent-09           ■ stopped             ││                                                                         │
+│▼ agent-10           ● running             ││                                                                         │
+│  ├ claude           ● working             ││                                                                         │
+│  └ shell            · idle                ││                                                                         │
+│▼ agent-11           ● running             ││                                                                         │
+│  ├ claude           ● working             ││                                                                         │
+│  └ shell            · idle                ││                                                                         │
+│▶ agent-12           ‖ paused              ││                                                                         │
+│▶ agent-13           ◌ hibernated          ││                                                                         │
+│▶ agent-14           ■ stopped             ││                                                                         │
+│▼ agent-15           ● running    ○1       ││                                                                         │
+╰───────────────────────────────────────────╯╰─────────────────────────────────────────────────────────────────────────╯
+ ⏎ attach · n new · t shell · i interact · p pause · x remove · g grid · / filter · : commands · ? help

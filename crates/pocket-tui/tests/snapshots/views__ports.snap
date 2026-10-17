@@ -1,0 +1,36 @@
+---
+source: crates/pocket-tui/tests/views.rs
+expression: "scenes::text(&buf)"
+---
+ pocket                                4 pockets · 4 sessions · ○ 1 need input · 6.0G of 31G RAM reserved · ↑37 req/min
+╭ POCKETS ──────────────────────────────────╮╭ webapp-1 ─  1 Session   2 Diff   3 Network  [4 Ports]  5 Info  ─────────╮
+│▶ api-fix            ‖ paused              ││ GUEST    HOST                     PROCESS          HOW                  │
+│▼ netlab             ● running    ⚠net     ││ 5173     127.0.0.1:5173           node             auto   o opens in the│
+│  └ build            ✓ exit 0              ││ 5432     127.0.0.1:15432          postgres         configured           │
+│▶ scratch            ◌ hibernated          ││                                                                         │
+│▼ webapp-1           ● running    ○1       ││                                                                         │
+│  ├ claude           ● working             ││                                                                         │
+│  ├ codex            ○ input needed        ││                                                                         │
+│  └ shell            · idle ⇄1             ││                                                                         │
+│                                           ││                                                                         │
+│                                           ││                                                                         │
+│                                           ││                                                                         │
+│                                           ││                                                                         │
+│                                           ││                                                                         │
+│                                           ││                                                                         │
+│                                           ││                                                                         │
+│                                           ││                                                                         │
+│                                           ││                                                                         │
+│                                           ││                                                                         │
+│                                           ││                                                                         │
+│                                           ││                                                                         │
+│                                           ││                                                                         │
+│                                           ││                                                                         │
+│                                           ││                                                                         │
+│                                           ││                                                                         │
+│                                           ││                                                                         │
+│                                           ││                                                                         │
+│                                           ││                                                                         │
+│                                           ││                                                                         │
+╰───────────────────────────────────────────╯╰─────────────────────────────────────────────────────────────────────────╯
+ ⏎ attach · n new · t shell · o open · p pause · x remove · g grid · / filter · : commands · ? help

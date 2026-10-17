@@ -18,6 +18,7 @@ commands:
   assets                      kernel + vmm + system + test-base
   presets                     build the preset images into the assets dir (isolated)
   lint-deps                   check crate dependency directions
+  preview-tui [SCENE…]        render dashboard scenes offline (--plain for text)
   fuzz [SECONDS]              run every fuzz target (default 60 s each)
   release                     build release tarballs, install script, PKGBUILD (local only)
   isolation-selftest          prove ci isolation cleans up after a failing, leaking command";
@@ -41,6 +42,21 @@ fn main() -> ExitCode {
         })(),
         Some("presets") => ci::presets_isolated(),
         Some("lint-deps") => lint::lint_deps(),
+        // Offline dashboard scenes (STYLES.md); no daemon or KVM needed.
+        Some("preview-tui") => util::run(
+            std::process::Command::new(env!("CARGO"))
+                .current_dir(util::root())
+                .args([
+                    "run",
+                    "-q",
+                    "-p",
+                    "pocket-tui",
+                    "--example",
+                    "preview",
+                    "--",
+                ])
+                .args(&args[1..]),
+        ),
         Some("release") => release::release(),
         Some("fuzz") => ci::fuzz_smoke(args.get(1).and_then(|s| s.parse().ok()).unwrap_or(60)),
         Some("isolation-selftest") => ci::selftest(),

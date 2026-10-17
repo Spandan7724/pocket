@@ -17,24 +17,22 @@ pub enum Clip {
     Ask,
 }
 
-/// `[ui] clipboard_osc52` from `~/.config/pocket/config.toml` (default allow).
-pub fn clipboard_policy() -> Clip {
+/// A `[ui]` string setting from `~/.config/pocket/config.toml`.
+pub fn ui_setting(key: &str) -> Option<String> {
     let dir = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|v| !v.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".config")
         });
-    let Ok(text) = std::fs::read_to_string(dir.join("pocket/config.toml")) else {
-        return Clip::Allow;
-    };
-    let Ok(doc) = text.parse::<toml_edit::DocumentMut>() else {
-        return Clip::Allow;
-    };
-    match doc
-        .get("ui")
-        .and_then(|u| u.get("clipboard_osc52"))
-        .and_then(|v| v.as_str())
-    {
+    let text = std::fs::read_to_string(dir.join("pocket/config.toml")).ok()?;
+    let doc = text.parse::<toml_edit::DocumentMut>().ok()?;
+    doc.get("ui")?.get(key)?.as_str().map(String::from)
+}
+
+/// `[ui] clipboard_osc52` (default allow).
+pub fn clipboard_policy() -> Clip {
+    match ui_setting("clipboard_osc52").as_deref() {
         Some("deny") => Clip::Deny,
         Some("ask") => Clip::Ask,
         _ => Clip::Allow,

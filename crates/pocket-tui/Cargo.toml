@@ -12,3 +12,8 @@ workspace = true
 
 [dependencies]
 pocket-proto = { path = "../pocket-proto", features = ["rpc"] }
+ratatui = "0.30"
+vt100 = "0.16"
+
+[dev-dependencies]
+insta = "1.49"

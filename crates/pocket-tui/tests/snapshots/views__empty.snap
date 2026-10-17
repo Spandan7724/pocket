@@ -1,0 +1,36 @@
+---
+source: crates/pocket-tui/tests/views.rs
+expression: "scenes::text(&buf)"
+---
+ pocket                                                    0 pockets · 0 sessions · 0B of 31G RAM reserved · ↑0 req/min
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                     No pockets yet
+
+                                           Press n to create your first pocket
+                                         or run `pocket new` inside a repository
+
+
+
+
+
+
+
+
+
+
+
+
+
+ n new pocket · : commands · ? help · q quit

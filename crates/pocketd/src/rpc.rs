@@ -156,7 +156,10 @@ fn wakes(req: &Request) -> Option<&str> {
     match req {
         Request::Exec { pocket, .. }
         | Request::SessionCreate { pocket, .. }
-        | Request::SessionList { pocket }
+        | Request::SessionList {
+            pocket,
+            peek: false,
+        }
         | Request::SessionKill { pocket, .. }
         | Request::AttachAuthorize { pocket, .. }
         | Request::ConfigPull { pocket, .. }
@@ -216,7 +219,18 @@ async fn handle(
                 .session_create(&pocket, name, argv, rows, cols, term)
                 .await?,
         },
-        Request::SessionList { pocket } => Response::Sessions(d.sessions(&pocket).await?),
+        Request::SessionList { pocket, peek } => {
+            if peek {
+                let rec = d.find(&pocket)?;
+                if rec.info.state != pocket_proto::rpc::PocketState::Running {
+                    return Err(err(
+                        ErrorCode::InvalidState,
+                        format!("pocket {} is {}", rec.info.name, rec.info.state.label()),
+                    ));
+                }
+            }
+            Response::Sessions(d.sessions(&pocket).await?)
+        }
         Request::SessionKill {
             pocket,
             session,

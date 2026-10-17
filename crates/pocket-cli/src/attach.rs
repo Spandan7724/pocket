@@ -605,6 +605,7 @@ fn run(
                         }
                         let list = match client.request(Request::SessionList {
                             pocket: pocket.into(),
+                            peek: false,
                         }) {
                             Ok(Response::Sessions(l)) => l,
                             _ => vec![],

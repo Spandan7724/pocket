@@ -1,0 +1,106 @@
+{
+  "host": {
+    "cpu_flags_hash": "280382ee3f2cce60",
+    "cpu_model": "Intel(R) Core(TM) i9-14900HX",
+    "host_kernel": "7.2.7-arch1-1",
+    "vmm_version": "cloud-hypervisor 54.0.0"
+  },
+  "image": "sha256:cd549319b174124853ee1f822c1c9cad2d9088433bcc7dbe010ac41ab91769b1",
+  "metrics": {
+    "attach_rtt_added_us": {
+      "max": 903.71,
+      "min": 15.31,
+      "n": 1000,
+      "p50": 19.78,
+      "p95": 30.52
+    },
+    "attach_rtt_us": {
+      "max": 922.98,
+      "min": 34.58,
+      "n": 1000,
+      "p50": 39.05,
+      "p95": 49.79
+    },
+    "cold_boot_ms": {
+      "max": 141.75,
+      "min": 118.6,
+      "n": 20,
+      "p50": 129.08,
+      "p95": 139.21
+    },
+    "density": {
+      "disk_per_pocket_mib": 4.4,
+      "guest_memory_mib": 2048,
+      "per_vm_pss_mib": 8.8,
+      "total_pss_mib": 87.8,
+      "vms": 10
+    },
+    "hibernate_image_mib": {
+      "max": 187.0,
+      "min": 187.0,
+      "n": 20,
+      "p50": 187.0,
+      "p95": 187.0
+    },
+    "hibernate_resume_ms": {
+      "max": 49.11,
+      "min": 14.6,
+      "n": 20,
+      "p50": 27.25,
+      "p95": 37.34
+    },
+    "hibernate_write_ms": {
+      "max": 2842.76,
+      "min": 512.31,
+      "n": 20,
+      "p50": 556.36,
+      "p95": 2566.21
+    },
+    "local_pty_rtt_us": {
+      "max": 291.13,
+      "min": 15.46,
+      "n": 1000,
+      "p50": 19.27,
+      "p95": 26.49
+    },
+    "new_e2e_ms": {
+      "max": 154.83,
+      "min": 99.68,
+      "n": 20,
+      "p50": 123.75,
+      "p95": 153.39
+    },
+    "pool_claim_ms": {
+      "max": 4.92,
+      "min": 2.11,
+      "n": 20,
+      "p50": 2.96,
+      "p95": 3.88
+    },
+    "pool_resume_api_ms": {
+      "max": 2.07,
+      "min": 1.47,
+      "n": 20,
+      "p50": 1.82,
+      "p95": 2.04
+    },
+    "restore_ms": {
+      "max": 40.79,
+      "min": 12.28,
+      "n": 20,
+      "p50": 25.18,
+      "p95": 39.47
+    }
+  },
+  "preset": "base",
+  "runs": 20,
+  "shape": {
+    "memory_mib": 2048,
+    "vcpus": 2
+  },
+  "template": {
+    "key": "d7b8ff4f1697c74c4ed7",
+    "size_mib": 191
+  },
+  "version": 1
+}

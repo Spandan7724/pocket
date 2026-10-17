@@ -1,0 +1,28 @@
+---
+source: crates/pocket-tui/tests/views.rs
+expression: "scenes::text(&buf)"
+---
+ pocket      4 pockets · 4 sessions · ○ 1 need input · 6.0G of 31G RAM reserved
+╭ POCKETS ───────────────────╮╭ webapp-1 ─ [1 Ses]  2 Dif   3 Net   4 Por   5 I╮
+│▶ api-fix     ‖ paused      ││ codex ○ input needed  100×30  codex            │
+│▼ netlab      ● running ⚠net││codex  gpt-5 · /work                            │
+│  └ build     ✓ exit 0      ││                                                │
+│▶ scratch     ◌ hibern.     ││user fix the flaky date test                    │
+│▼ webapp-1    ● running ○1  ││                                                │
+│  ├ claude    ● working     ││codex The test depends on the local timezone. I │
+│  ├ codex     ○ input       ││                                                │
+│  └ shell     · idle ⇄1     ││TZ=UTC npm test -- dates                        │
+│                            ││                                                │
+│                            ││Allow this command? [y/n]                       │
+│                            ││                                                │
+│                            ││                                                │
+│                            ││                                                │
+│                            ││                                                │
+│                            ││                                                │
+│                            ││                                                │
+│                            ││                                                │
+│                            ││                                                │
+│                            ││                                                │
+│                            ││                                                │
+╰────────────────────────────╯╰────────────────────────────────────────────────╯
+ ⏎ attach · n new · t shell · i interact · p pause · x remove · ? help

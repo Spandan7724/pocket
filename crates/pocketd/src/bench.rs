@@ -134,10 +134,18 @@ async fn restore(
         .restore(snap, &s)
         .await
         .map_err(|e| err(ErrorCode::Vmm, e.to_string()))?;
+    let api = t.elapsed();
     let b = BenchVm { vm, dir, rt };
     let r = async {
         let g = connect(&b.vm).await?;
+        let ready = t.elapsed();
         restore_hook(&g, "bench", &hex(&random_bytes(16)), 1, Restore::Clone).await?;
+        tracing::debug!(
+            "bench restore: VMM API up {:.1} ms, guest Ready {:.1} ms, restore hook done {:.1} ms",
+            ms(api),
+            ms(ready),
+            ms(t.elapsed())
+        );
         Ok::<_, pocket_proto::rpc::RpcError>(g)
     }
     .await;

@@ -1,0 +1,36 @@
+---
+source: crates/pocket-tui/tests/views.rs
+expression: "scenes::text(&buf)"
+---
+ pocket                                4 pockets · 4 sessions · ○ 1 need input · 6.0G of 31G RAM reserved · ↑37 req/min
+╭ POCKETS ──────────────────────────────────╮╭ webapp-1 ─  1 Session  [2 Diff]  3 Network   4 Ports   5 Info  ─────────╮
+│▶ api-fix            ‖ paused              ││ 2 files +14 -1   a apply · P pull request · J/K scroll                  │
+│▼ netlab             ● running    ⚠net     ││  src/middleware/ratelimit.ts              +12  -0                       │
+│  └ build            ✓ exit 0              ││  src/routes/login.ts                      +2   -1                       │
+│▶ scratch            ◌ hibernated          ││                                                                         │
+│▼ webapp-1           ● running    ○1       ││diff --git a/src/middleware/ratelimit.ts b/src/middleware/ratelimit.ts   │
+│  ├ claude           ● working             ││new file mode 100644                                                     │
+│  ├ codex            ○ input needed        ││index 0000000..3b18e51                                                   │
+│  └ shell            · idle ⇄1             ││--- /dev/null                                                            │
+│                                           ││+++ b/src/middleware/ratelimit.ts                                        │
+│                                           ││@@ -0,0 +1,12 @@                                                         │
+│                                           ││+import type { Request, Response, NextFunction } from "express";         │
+│                                           ││+                                                                        │
+│                                           ││+const buckets = new Map<string, { tokens: number; at: number }>();      │
+│                                           ││+                                                                        │
+│                                           ││+export function rateLimit(perMinute = 10) {                             │
+│                                           ││+  return (req: Request, res: Response, next: NextFunction) => {         │
+│                                           ││+    const key = req.ip ?? "anon";                                       │
+│                                           ││+    const b = buckets.get(key) ?? { tokens: perMinute, at: Date.now() };│
+│                                           ││+    if (b.tokens <= 0) return res.status(429).end();                    │
+│                                           ││+    b.tokens--; buckets.set(key, b); next();                            │
+│                                           ││+  };                                                                    │
+│                                           ││+}                                                                       │
+│                                           ││diff --git a/src/routes/login.ts b/src/routes/login.ts                   │
+│                                           ││index 9a1c0d2..e4b77f0 100644                                            │
+│                                           ││--- a/src/routes/login.ts                                                │
+│                                           ││+++ b/src/routes/login.ts                                                │
+│                                           ││@@ -1,6 +1,8 @@                                                          │
+│                                           ││ import { Router } from "express";                                       │
+╰───────────────────────────────────────────╯╰─────────────────────────────────────────────────────────────────────────╯
+ ⏎ attach · n new · t shell · a apply · P PR · p pause · x remove · g grid · / filter · : commands · ? help

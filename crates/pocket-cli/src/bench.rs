@@ -43,35 +43,14 @@ fn noise_floor(metric: &str) -> f64 {
 }
 
 fn new_req(name: &str, preset: &str, memory_mib: Option<u32>) -> NewPocket {
-    NewPocket {
-        name: Some(name.into()),
-        preset: Some(preset.into()),
-        repo: None,
-        carry_changes: false,
-        cpus: None,
-        memory_mib,
-        disk_mib: None,
-        net_profile: None,
-        allow: vec![],
-        deny: vec![],
-        command: None,
-        term: Some("xterm-256color".into()),
-        secrets: Some(vec![]),
-        copy_secrets: vec![],
-        sync_config: false,
-        ssh_agent: false,
-        auto_forward: true,
-        forward: vec![],
-        env: vec![],
-        git_protected: vec![],
-        git_allow_push: vec![],
-        setup: None,
-        share: vec![],
-        idle_pause_ms: Some(0),
-        idle_hibernate_ms: Some(0),
-        net_mode: None,
-        template: None,
-    }
+    let mut r = crate::default_new(Some(name.into()), Some(preset.into()), None);
+    r.memory_mib = memory_mib;
+    r.term = Some("xterm-256color".into());
+    r.secrets = Some(vec![]);
+    r.sync_config = false;
+    r.idle_pause_ms = Some(0);
+    r.idle_hibernate_ms = Some(0);
+    r
 }
 
 fn attach(c: &mut Client, pocket: &str) -> Result<std::os::unix::net::UnixStream> {

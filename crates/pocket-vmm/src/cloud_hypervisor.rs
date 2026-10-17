@@ -194,14 +194,17 @@ impl CloudHypervisor {
         api_socket: PathBuf,
         vsock_uds: PathBuf,
     ) -> Result<VmHandle, VmmError> {
-        let (mut cmd, unit) = match &spec.cgroup {
-            Some(cg) if cgroup::systemd_scopes_available() => {
-                (cgroup::wrap(cg, &inner), Some(cg.unit.clone()))
-            }
-            _ => {
+        let scoped = spec
+            .cgroup
+            .as_ref()
+            .filter(|_| cgroup::systemd_scopes_available());
+        let adopt = scoped.is_some() && cgroup::busctl_available();
+        let (mut cmd, unit) = match scoped {
+            Some(cg) if !adopt => (cgroup::wrap(cg, &inner), Some(cg.unit.clone())),
+            other => {
                 let mut c = Command::new(inner.get_program());
                 c.args(inner.get_args());
-                (c, None)
+                (c, other.map(|cg| cg.unit.clone()))
             }
         };
         let log = std::fs::File::create(&spec.log_path)
@@ -221,6 +224,10 @@ impl CloudHypervisor {
         let pid = child.id();
         drop(child); // reaped by `wait_exit`
         let start_time = process::start_time(pid).unwrap_or(0);
+        let adoption = match scoped.filter(|_| adopt) {
+            Some(cg) => Some(cgroup::adopt(cg, pid).map_err(VmmError::io("start busctl"))?),
+            None => None,
+        };
         let h = VmHandle {
             id: spec.id.clone(),
             backend: NAME.into(),
@@ -230,7 +237,26 @@ impl CloudHypervisor {
             vsock_uds,
             cgroup_unit: unit,
         };
-        if let Err(e) = self.wait_api(&h, &spec.log_path).await {
+        let ready = self.wait_api(&h, &spec.log_path).await;
+        let scoped = match adoption {
+            Some(child) => tokio::task::spawn_blocking(move || child.wait_with_output())
+                .await
+                .map_err(|e| VmmError::io("busctl")(std::io::Error::other(e)))
+                .and_then(|o| o.map_err(VmmError::io("busctl")))
+                .and_then(|o| {
+                    if o.status.success() {
+                        Ok(())
+                    } else {
+                        Err(VmmError::io("create the VM's cgroup scope")(
+                            std::io::Error::other(
+                                String::from_utf8_lossy(&o.stderr).trim().to_string(),
+                            ),
+                        ))
+                    }
+                }),
+            None => Ok(()),
+        };
+        if let Err(e) = ready.and(scoped) {
             let _ = self.kill(&h).await;
             return Err(e);
         }

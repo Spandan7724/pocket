@@ -235,6 +235,9 @@ pub enum Request {
     },
     SessionList {
         pocket: String,
+        /// Don't resume a paused / hibernated pocket to answer (the dashboard's polling).
+        #[serde(default)]
+        peek: bool,
     },
     SessionKill {
         pocket: String,

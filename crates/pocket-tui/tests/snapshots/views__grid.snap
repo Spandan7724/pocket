@@ -1,0 +1,36 @@
+---
+source: crates/pocket-tui/tests/views.rs
+expression: "scenes::text(&buf)"
+---
+ pocket                                4 pockets · 4 sessions · ○ 1 need input · 6.0G of 31G RAM reserved · ↑37 req/min
+╭ webapp-1:codex ○ input needed ───────────────────────────╮╭ webapp-1:claude ● working ───────────────────────────────╮
+│codex  gpt-5 · /work                                      ││> Add rate limiting to the /login route                   │
+│                                                          ││                                                          │
+│user fix the flaky date test                              ││● I'll add a token bucket in src/middleware/ratelimit.ts. │
+│                                                          ││                                                          │
+│codex The test depends on the local timezone. I want to ru││⎿ Wrote 48 lines to src/middleware/ratelimit.ts           │
+│                                                          ││⎿ Updated src/routes/login.ts (+3 -1)                     │
+│TZ=UTC npm test -- dates                                  ││                                                          │
+│                                                          ││● Running the tests…                                      │
+│Allow this command? [y/n]                                 ││npm test -- login                                         │
+│                                                          ││✓ 14 passed                                               │
+│                                                          ││                                                          │
+│                                                          ││✻ Thinking… (12s · esc to interrupt)                      │
+│                                                          ││                                                          │
+╰──────────────────────────────────────────────────────────╯╰──────────────────────────────────────────────────────────╯
+╭ webapp-1:shell · idle ───────────────────────────────────╮
+│dev@webapp-1:/work$ npm run dev                           │
+│  VITE v6.2  ready in 312 ms                              │
+│  ➜  Local: http://localhost:5173/                        │
+│                                                          │
+│                                                          │
+│                                                          │
+│                                                          │
+│                                                          │
+│                                                          │
+│                                                          │
+│                                                          │
+│                                                          │
+│                                                          │
+╰──────────────────────────────────────────────────────────╯
+ ⏎ attach · ↑↓ focus · z zoom · g tree · ? help · q quit

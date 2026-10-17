@@ -1,0 +1,36 @@
+---
+source: crates/pocket-tui/tests/views.rs
+expression: "scenes::text(&buf)"
+---
+ pocket                                4 pockets · 4 sessions · ○ 1 need input · 6.0G of 31G RAM reserved · ↑37 req/min
+╭ POCKETS ──────────────────────────────────╮╭ webapp-1 ─ [1 Session]  2 Diff   3 Network   4 Ports   5 Info  ─────────╮
+│▶ api-fix            ‖ paused              ││ codex ○ input needed  100×30  codex                                     │
+│▼ netlab             ● running    ⚠net     ││codex  gpt-5 · /work                                                     │
+│  └ build            ✓ e╭ keys ──────────────────────────────────────────────────────────────╮                        │
+│▶ scratch            ◌ h│ ↑↓ j k      move                                                   │                        │
+│▼ webapp-1           ● r│ ← → h l     collapse / expand                                      │                        │
+│  ├ claude           ● w│ ⏎           attach (full screen; Ctrl-] d returns here)            │ant to run:             │
+│  ├ codex            ○ i│ i           type into the session in the pane (Ctrl-] leaves)      │                        │
+│  └ shell            · i│ Tab 1-5     Session · Diff · Network · Ports · Info                │                        │
+│                        │ d N P I     jump to Diff · Network · Ports · Info                  │                        │
+│                        │ g / z       grid of live sessions / zoom one                       │                        │
+│                        │ n           new pocket                                             │                        │
+│                        │ t           new shell session                                      │                        │
+│                        │ p / H       pause–resume / hibernate                               │                        │
+│                        │ s / x       stop–start / remove (asks first)                       │                        │
+│                        │ a / P       apply / pull request (Diff tab)                        │                        │
+│                        │ o A D       allow once · allow for pocket · deny (Network tab)     │                        │
+│                        │ o           open forwarded port (Ports tab)                        │                        │
+│                        │ /           filter                                                 │                        │
+│                        │ : Ctrl-P    command palette                                        │                        │
+│                        │ T           theme: dark · light · no colour                        │                        │
+│                        │ r           refresh                                                │                        │
+│                        │ q           quit (pockets keep running)                            │                        │
+│                        │                                                                    │                        │
+│                        │ ● working  ○ input needed  · idle  ‖ paused  ◌ hibernated  ✓ ✗ exit│                        │
+│                        ╰────────────────────────────────────────────────────────────────────╯                        │
+│                                           ││                                                                         │
+│                                           ││                                                                         │
+│                                           ││                                                                         │
+╰───────────────────────────────────────────╯╰─────────────────────────────────────────────────────────────────────────╯
+ ⏎ attach · n new · t shell · i interact · p pause · x remove · g grid · / filter · : commands · ? help
