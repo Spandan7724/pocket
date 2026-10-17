@@ -12,10 +12,10 @@ use sha2::{Digest, Sha256};
 use crate::layers;
 
 const MAX_MANIFEST: u64 = 4 << 20;
-const MAX_RETRIES: u32 = 5;
+const MAX_RETRIES: u32 = 8;
 
 /// Backoff for rate-limited or unavailable registries: `Retry-After` when given, else
-/// 1, 2, 4, 8, 16 s; capped at 30 s.
+/// 1, 2, 4, 8, 16, 30, 30, 30 s (about two minutes in all).
 fn retry_delay(attempt: u32, retry_after_secs: Option<u64>) -> Duration {
     let secs = retry_after_secs.unwrap_or(1 << attempt.min(4));
     Duration::from_secs(secs.min(30))
