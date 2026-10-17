@@ -3,6 +3,7 @@
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use pocket_proto::frame::{recv, send};
@@ -100,6 +101,39 @@ pub fn serve_control(conn: File, ready: &ReadyInfo) {
         .retain(|(i, _)| *i != id);
 }
 
+/// Set by `Seal`, cleared by `Restored` (the restore hook).
+static SEALED: AtomicBool = AtomicBool::new(false);
+
+fn sealed() -> Result<(), GuestError> {
+    if SEALED.load(Ordering::SeqCst) {
+        return Err(GuestError::new(
+            ErrorKind::InvalidRequest,
+            "this VM was snapshotted and the restore hook has not run yet",
+        ));
+    }
+    Ok(())
+}
+
+fn set_identity(hostname: &str, machine_id: &str) -> Result<(), GuestError> {
+    sys::sethostname(hostname).map_err(io_err("sethostname"))?;
+    let hosts = format!("127.0.0.1 localhost\n127.0.1.1 {hostname}\n::1 localhost ip6-localhost\n");
+    let id = format!("{machine_id}\n");
+    let files = [
+        ("/etc/hosts", hosts.as_str()),
+        ("/etc/hostname", &format!("{hostname}\n")),
+        ("/etc/machine-id", &id),
+    ];
+    for (path, text) in files {
+        if let Err(e) = fs::write(path, text) {
+            log!("write {path}: {e}");
+        }
+    }
+    if fs::symlink_metadata("/var/lib/dbus/machine-id").is_ok_and(|m| m.is_file()) {
+        let _ = fs::write("/var/lib/dbus/machine-id", &id);
+    }
+    Ok(())
+}
+
 fn io_err(what: &str) -> impl Fn(std::io::Error) -> GuestError + '_ {
     move |e| GuestError::new(ErrorKind::Io, format!("{what}: {e}"))
 }
@@ -112,15 +146,10 @@ fn handle(id: u64, req: HostReq) -> Result<Reply, GuestError> {
             time_unix_nanos,
             env,
             proxy_port,
+            machine_id,
         } => {
-            sys::sethostname(&hostname).map_err(io_err("sethostname"))?;
-            let hosts =
-                format!("127.0.0.1 localhost\n127.0.1.1 {hostname}\n::1 localhost ip6-localhost\n");
-            if let Err(e) = fs::write("/etc/hosts", hosts)
-                .and_then(|()| fs::write("/etc/hostname", format!("{hostname}\n")))
-            {
-                log!("write /etc/hosts: {e}");
-            }
+            sealed()?;
+            set_identity(&hostname, &machine_id)?;
             sys::add_entropy(&rng_seed).map_err(io_err("rng seed"))?;
             if time_unix_nanos > 0 {
                 sys::set_realtime(time_unix_nanos).map_err(io_err("set clock"))?;
@@ -147,7 +176,8 @@ fn handle(id: u64, req: HostReq) -> Result<Reply, GuestError> {
             cwd,
             pty,
             user,
-        } => exec::start(id, &argv, &env, &cwd, pty, user.as_deref())
+        } => sealed()
+            .and_then(|()| exec::start(id, &argv, &env, &cwd, pty, user.as_deref()))
             .map(|pid| Reply::ExecStarted { pid }),
         HostReq::SessionCreate {
             name,
@@ -156,9 +186,11 @@ fn handle(id: u64, req: HostReq) -> Result<Reply, GuestError> {
             cwd,
             size,
             user,
-        } => session::create(&name, &argv, &env, &cwd, size, user.as_deref())
+        } => sealed()
+            .and_then(|()| session::create(&name, &argv, &env, &cwd, size, user.as_deref()))
             .map(|pid| Reply::SessionCreated { pid }),
         HostReq::AuthorizeAttach { session, token } => {
+            sealed()?;
             session::authorize(&session, token);
             Ok(Reply::Done)
         }
@@ -200,11 +232,49 @@ fn handle(id: u64, req: HostReq) -> Result<Reply, GuestError> {
             rng_seed,
             time_unix_nanos,
             hostname,
+            machine_id,
+            clone,
         } => {
+            let t0 = sys::boottime_ns();
             sys::add_entropy(&rng_seed).map_err(io_err("rng seed"))?;
+            let t1 = sys::boottime_ns();
             sys::set_realtime(time_unix_nanos).map_err(io_err("set clock"))?;
-            sys::sethostname(&hostname).map_err(io_err("sethostname"))?;
-            log!("restored: generation {generation}");
+            let t2 = sys::boottime_ns();
+            if clone {
+                session::forget_all();
+            }
+            let t3 = sys::boottime_ns();
+            set_identity(&hostname, &machine_id)?;
+            let t4 = sys::boottime_ns();
+            crate::ports::REANNOUNCE.store(true, Ordering::SeqCst);
+            SEALED.store(false, Ordering::SeqCst);
+            log!(
+                "restored: generation {generation}{} (rng {} clock {} kill {} identity {} µs)",
+                if clone { ", new identity" } else { "" },
+                (t1 - t0) / 1000,
+                (t2 - t1) / 1000,
+                (t3 - t2) / 1000,
+                (t4 - t3) / 1000
+            );
+            Ok(Reply::Done)
+        }
+        HostReq::Seal => {
+            // Copy the identity files up into the overlay now (copy-up fsyncs), so the
+            // restore hook only rewrites them.
+            let host = fs::read_to_string("/proc/sys/kernel/hostname").unwrap_or_default();
+            let host = host.trim();
+            let mid = fs::read_to_string("/etc/machine-id").unwrap_or_default();
+            let mid = mid.trim();
+            let mid = if pocket_proto::guest::valid_machine_id(mid) {
+                mid.to_string()
+            } else {
+                "0".repeat(32)
+            };
+            if pocket_proto::guest::valid_hostname(host) {
+                set_identity(host, &mid)?;
+            }
+            SEALED.store(true, Ordering::SeqCst);
+            log!("sealed for a snapshot; waiting for the restore hook");
             Ok(Reply::Done)
         }
         HostReq::Shutdown { .. } => unreachable!("handled by the caller"),

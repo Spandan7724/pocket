@@ -150,3 +150,98 @@ mod tests {
         assert_eq!(s.feed(b"\x1bPq#0\x07"), vec![]);
     }
 }
+
+/// The last line of a session's output with escape sequences removed, for the host's
+/// "waiting at a prompt" check. A carriage return starts the line over (redraws).
+#[derive(Default)]
+pub struct Tail {
+    cur: Vec<u8>,
+    last: Vec<u8>,
+    esc: u8,
+    /// A carriage return: the next printable byte starts the line over.
+    cr: bool,
+}
+
+impl Tail {
+    pub fn feed(&mut self, data: &[u8]) {
+        const LIMIT: usize = pocket_proto::guest::MAX_TAIL;
+        for &b in data {
+            match self.esc {
+                // ESC seen: `[` = CSI, `]` = OSC, else a two-byte sequence.
+                1 => {
+                    self.esc = match b {
+                        b'[' => 2,
+                        b']' | b'P' | b'_' | b'^' | b'X' => 3,
+                        _ => 0,
+                    }
+                }
+                2 => {
+                    if (0x40..=0x7e).contains(&b) {
+                        self.esc = 0;
+                    }
+                }
+                3 => match b {
+                    0x07 => self.esc = 0,
+                    0x1b => self.esc = 4,
+                    _ => {}
+                },
+                4 => self.esc = if b == b'\\' { 0 } else { 3 },
+                _ => match b {
+                    0x1b => self.esc = 1,
+                    b'\n' => {
+                        if self.cur.iter().any(|c| !c.is_ascii_whitespace()) {
+                            self.last = std::mem::take(&mut self.cur);
+                        }
+                        self.cur.clear();
+                        self.cr = false;
+                    }
+                    b'\r' => self.cr = true,
+                    0x08 => {
+                        self.cur.pop();
+                    }
+                    b if b < 0x20 || b == 0x7f => {}
+                    b => {
+                        if std::mem::take(&mut self.cr) {
+                            self.cur.clear();
+                        }
+                        if self.cur.len() < LIMIT {
+                            self.cur.push(b);
+                        }
+                    }
+                },
+            }
+        }
+    }
+
+    pub fn text(&self) -> String {
+        let src = if self.cur.iter().any(|c| !c.is_ascii_whitespace()) {
+            &self.cur
+        } else {
+            &self.last
+        };
+        let mut s: String = String::from_utf8_lossy(src)
+            .chars()
+            .filter(|c| !c.is_control())
+            .collect();
+        while s.len() > pocket_proto::guest::MAX_TAIL {
+            s.pop();
+        }
+        s
+    }
+}
+
+#[cfg(test)]
+mod tail_tests {
+    use super::Tail;
+
+    #[test]
+    fn strips_escapes_and_keeps_the_last_line() {
+        let mut t = Tail::default();
+        t.feed(b"building...\r\n\x1b[1;32mdone\x1b[0m\r\n\x1b]0;title\x07Allow? [y/n] ");
+        assert_eq!(t.text(), "Allow? [y/n] ");
+        t.feed(b"\r\n");
+        assert_eq!(t.text(), "Allow? [y/n] ");
+        t.feed(b"progress 10%\rprogress 20%");
+        assert_eq!(t.text(), "progress 20%");
+    }
+}

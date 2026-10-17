@@ -108,7 +108,7 @@ fn new_attach_type_detach_reattach_rm() {
     );
     let sessions = env.ok(&["sessions", &name]);
     assert!(
-        sessions.contains("shell") && sessions.contains("running"),
+        sessions.contains("shell") && !sessions.contains("exit"),
         "{sessions}"
     );
 
@@ -194,7 +194,14 @@ fn terminal_restored_on_crash_and_on_signals() {
         );
     }
     // The session survived all of it.
-    assert!(env.ok(&["sessions", &name]).contains("running"));
+    let list = env.json(&["sessions", &name]);
+    assert!(
+        list.as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["exited"].is_null() && s["state"] != "Exited"),
+        "{list}"
+    );
 }
 
 /// Median and p95 round trip of one byte through `pty` running `stty raw -echo; cat`.

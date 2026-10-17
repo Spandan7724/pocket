@@ -15,6 +15,23 @@ pub fn start_time(pid: u32) -> Option<u64> {
     rest.split_whitespace().nth(19)?.parse().ok()
 }
 
+/// User + system CPU time of the whole process (all threads), in clock ticks.
+pub fn cpu_ticks(pid: u32, start: u64) -> Option<u64> {
+    let s = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let rest = &s[s.rfind(')')? + 2..];
+    let f: Vec<&str> = rest.split_whitespace().collect();
+    if f.get(19)?.parse::<u64>().ok()? != start {
+        return None;
+    }
+    Some(f.get(11)?.parse::<u64>().ok()? + f.get(12)?.parse::<u64>().ok()?)
+}
+
+pub fn clock_ticks_per_sec() -> u64 {
+    // SAFETY: sysconf has no preconditions.
+    let n = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if n > 0 { n as u64 } else { 100 }
+}
+
 pub fn alive(pid: u32, start: u64) -> bool {
     start_time(pid) == Some(start)
 }

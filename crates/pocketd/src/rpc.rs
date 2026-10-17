@@ -151,11 +151,34 @@ async fn connection(
     Ok(())
 }
 
+/// Requests that need the pocket's guest resume a paused or hibernated pocket first.
+fn wakes(req: &Request) -> Option<&str> {
+    match req {
+        Request::Exec { pocket, .. }
+        | Request::SessionCreate { pocket, .. }
+        | Request::SessionList { pocket }
+        | Request::SessionKill { pocket, .. }
+        | Request::AttachAuthorize { pocket, .. }
+        | Request::ConfigPull { pocket, .. }
+        | Request::Diff { pocket, .. }
+        | Request::Apply { pocket, .. }
+        | Request::Pr { pocket, .. }
+        | Request::Sync { pocket, .. }
+        | Request::Ports { pocket }
+        | Request::PortAdd { pocket, .. }
+        | Request::PasteImage { pocket, .. } => Some(pocket),
+        _ => None,
+    }
+}
+
 async fn handle(
     d: &Arc<Daemon>,
     req: Request,
     progress: &(dyn Fn(&str) + Send + Sync),
 ) -> Result<Response, RpcError> {
+    if let Some(p) = wakes(&req) {
+        d.wake(p).await?;
+    }
     Ok(match req {
         Request::NewPocket(n) => Response::Pocket(d.new_pocket(n, progress).await?),
         Request::List => Response::Pockets(d.list()?),
@@ -341,6 +364,29 @@ async fn handle(
             header,
         } => Response::Secret(d.secret_bind(&name, &hosts, &env, &header)?),
         Request::Doctor => Response::Doctor(doctor::checks(d)),
-        Request::DaemonStop => Response::Done,
+        Request::DaemonStop => {
+            crate::pool::drain(d).await;
+            Response::Done
+        }
+        Request::Templates => Response::Templates(crate::templates::list(d)?),
+        Request::TemplateBuild {
+            preset,
+            cpus,
+            memory_mib,
+        } => Response::Templates(vec![
+            crate::templates::build_now(d, &preset, cpus, memory_mib, progress).await?,
+        ]),
+        Request::Pause { pocket } => Response::Pocket(d.pause(&pocket).await?),
+        Request::Resume { pocket } => Response::Pocket(d.resume(&pocket).await?),
+        Request::Hibernate { pocket } => Response::Pocket(d.hibernate(&pocket).await?),
+        Request::Pool => Response::Pool(d.pool.info(d)),
+        Request::Bench {
+            runs,
+            preset,
+            density,
+            memory_mib,
+        } => Response::Json(
+            crate::bench::run(d, runs, &preset, density, memory_mib, progress).await?,
+        ),
     })
 }

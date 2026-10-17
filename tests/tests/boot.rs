@@ -111,9 +111,14 @@ fn boots_as_pid1_with_overlay_root_and_reports_ready() {
         time_unix_nanos: 1_900_000_000_000_000_000,
         env: vec![("POCKET_TEST".into(), "yes".into())],
         proxy_port: 3128,
+        machine_id: "00112233445566778899aabbccddeeff".into(),
     });
     assert_eq!(r, Ok(Reply::Done));
     assert_eq!(sh(&mut ctl, u, "hostname").trim(), "configured");
+    assert_eq!(
+        sh(&mut ctl, u, "cat /etc/machine-id").trim(),
+        "00112233445566778899aabbccddeeff"
+    );
     assert_eq!(sh(&mut ctl, u, "echo $POCKET_TEST").trim(), "yes");
     let year: i32 = sh(&mut ctl, u, "date -u +%Y").trim().parse().unwrap();
     assert_eq!(year, 2030);

@@ -10,10 +10,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use pocket_proto::guest::{GuestEvent, HostReq, PtySize, RNG_SEED_LEN, Reply, SessionInfo};
 use pocket_proto::rpc::{ErrorCode, Event, NewPocket, PocketInfo, PocketState, RpcError};
 use pocket_store::{PocketRecord, Store};
-use pocket_vmm::{
-    CgroupSpec, DiskRole, DiskSpec, DiskTransport, StopMode, VmHandle, VmSpec, VmmBackend,
-    guest_devices,
-};
+use pocket_vmm::{CgroupSpec, StopMode, VmHandle, VmSpec, VmmBackend, guest_devices};
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
@@ -25,9 +22,9 @@ use crate::{inject, net, presets, provision, secrets, workspace};
 pub const BOOT_ARGS: &str = "root=/dev/vda ro rootfstype=erofs init=/pocket-init reboot=k \
     panic=-1 8250.nr_uarts=0 i8042.noaux i8042.nomux i8042.dumbkbd quiet rcupdate.rcu_expedited=1";
 pub const GUEST_PROXY_PORT: u16 = 3128;
-const DEFAULT_CPUS: u8 = 2;
-const DEFAULT_MEMORY_MIB: u32 = 2048;
-const DEFAULT_DISK_MIB: u64 = 20 << 10;
+pub const DEFAULT_CPUS: u8 = 2;
+pub const DEFAULT_MEMORY_MIB: u32 = 2048;
+pub const DEFAULT_DISK_MIB: u64 = 20 << 10;
 /// Allowed on top of guest RAM in the cgroup memory limit: the VMM itself plus base-image
 /// pages the guest reads through DAX, which are charged to the scope as file memory (an
 /// agent like Claude Code maps a few hundred MiB of it).
@@ -56,7 +53,7 @@ pub fn random_bytes(n: usize) -> Vec<u8> {
     v
 }
 
-fn hex(b: &[u8]) -> String {
+pub fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
@@ -106,6 +103,7 @@ pub struct Live {
     pub hooks: Arc<PocketHooks>,
     pub host: crate::host::HostState,
     pub stopping: AtomicBool,
+    pub paused: AtomicBool,
     pub tasks: Mutex<Vec<JoinHandle<()>>>,
 }
 
@@ -121,8 +119,12 @@ pub struct Daemon {
     pub paths: Paths,
     pub store: Mutex<Store>,
     pub backend: Arc<dyn VmmBackend>,
-    live: Mutex<HashMap<String, Arc<Live>>>,
+    pub(crate) live: Mutex<HashMap<String, Arc<Live>>>,
     op_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Host-side traffic per pocket id (proxy streams, port forwards): idle detection.
+    activity: Mutex<HashMap<String, Arc<Activity>>>,
+    pub pool: crate::pool::Pool,
+    pub config: crate::config::DaemonConfig,
     pub events: broadcast::Sender<(u64, Event)>,
     seq: AtomicU64,
     pub vault: secrets::Vault,
@@ -171,10 +173,85 @@ pub struct Meta {
     pub template: Option<String>,
     #[serde(default)]
     pub shares: Vec<pocket_proto::rpc::ShareDir>,
+    /// `/etc/machine-id`, stable for the pocket's life.
+    #[serde(default)]
+    pub machine_id: Option<String>,
+    /// Restore hooks run so far (template clone, pool claim, hibernation, resume).
+    #[serde(default)]
+    pub restore_generation: u64,
+    /// Snapshot template the pocket was restored from.
+    #[serde(default)]
+    pub snapshot_template: Option<String>,
+    /// `cold`, `template`, `pool` or `hibernation`.
+    #[serde(default)]
+    pub started_from: Option<String>,
+    /// Hibernation snapshot directory name inside the pocket dir, with its host.
+    #[serde(default)]
+    pub hibernation: Option<(String, pocket_vmm::HostFingerprint)>,
+    #[serde(default)]
+    pub idle_pause_ms: Option<u64>,
+    #[serde(default)]
+    pub idle_hibernate_ms: Option<u64>,
+    #[serde(default)]
+    pub net_mode: Option<String>,
+}
+
+pub type EventRx = tokio::sync::mpsc::UnboundedReceiver<GuestEvent>;
+
+/// How `attach_guest` brings a started VM into service.
+pub struct GuestSetup {
+    /// Send `Configure` and provision (every boot or restore that takes an identity).
+    pub configure: bool,
+    /// Run the restore hook first.
+    pub restore: Option<Restore>,
+    /// An already connected control connection (warm pool).
+    pub pre: Option<(Arc<GuestConn>, EventRx)>,
+}
+
+pub enum Launch<'a> {
+    Cold,
+    Template(&'a crate::templates::Template),
+    /// The pocket's own hibernation snapshot.
+    Hibernation(pocket_vmm::SnapshotRef),
+    /// Claimed from the warm pool: restored from a template, connected and paused.
+    Pool(crate::pool::PoolVm),
+}
+
+/// How a VM got its memory: booted, or restored (then the restore hook runs first).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Restore {
+    /// From a template or another pocket: takes a new identity.
+    Clone,
+    /// Its own snapshot or pause (hibernate/resume): keeps its identity and sessions.
+    Own,
 }
 
 fn yes() -> bool {
     true
+}
+
+/// Open host-side streams of a pocket and when the last one started or ended.
+#[derive(Default)]
+pub struct Activity {
+    pub open: std::sync::atomic::AtomicUsize,
+    pub last_ms: AtomicU64,
+}
+
+impl Activity {
+    pub fn begin(self: &Arc<Self>) -> ActivityGuard {
+        self.open.fetch_add(1, Ordering::SeqCst);
+        self.last_ms.store(now_ms(), Ordering::SeqCst);
+        ActivityGuard(self.clone())
+    }
+}
+
+pub struct ActivityGuard(Arc<Activity>);
+
+impl Drop for ActivityGuard {
+    fn drop(&mut self) {
+        self.0.open.fetch_sub(1, Ordering::SeqCst);
+        self.0.last_ms.store(now_ms(), Ordering::SeqCst);
+    }
 }
 
 impl Daemon {
@@ -193,7 +270,19 @@ impl Daemon {
             approval_seq: AtomicU64::new(1),
             ca: Mutex::new(None),
             tls: std::sync::OnceLock::new(),
+            activity: Mutex::new(HashMap::new()),
+            pool: Default::default(),
+            config: crate::config::DaemonConfig::load(),
         })
+    }
+
+    pub fn activity(&self, id: &str) -> Arc<Activity> {
+        self.activity
+            .lock()
+            .unwrap()
+            .entry(id.to_string())
+            .or_default()
+            .clone()
     }
 
     pub fn next_approval(&self) -> u64 {
@@ -281,7 +370,7 @@ impl Daemon {
         f(&self.store()).map_err(|e| err(ErrorCode::Internal, e.to_string()))
     }
 
-    fn op_lock(&self, id: &str) -> Arc<tokio::sync::Mutex<()>> {
+    pub(crate) fn op_lock(&self, id: &str) -> Arc<tokio::sync::Mutex<()>> {
         self.op_locks
             .lock()
             .unwrap()
@@ -298,7 +387,7 @@ impl Daemon {
         self.live.lock().unwrap().get(id).cloned()
     }
 
-    fn set_state(&self, rec: &PocketRecord, to: PocketState) -> R<()> {
+    pub(crate) fn set_state(&self, rec: &PocketRecord, to: PocketState) -> R<()> {
         let from = self
             .db(|s| s.pocket(&rec.info.name))?
             .map(|r| r.info.state)
@@ -344,10 +433,14 @@ impl Daemon {
         }
     }
 
-    fn info(&self, mut r: PocketRecord) -> PocketInfo {
+    pub(crate) fn info(&self, mut r: PocketRecord) -> PocketInfo {
         r.info.disk_used_bytes = pocket_image::disk::allocated_bytes(
             &self.paths.pocket_dir(&r.info.id).join("disk.raw"),
         );
+        let m = Self::meta(&r);
+        r.info.started_from = m.started_from;
+        r.info.template = m.snapshot_template;
+        r.info.net_mode = Some(m.net_mode.unwrap_or_else(|| "proxy".into()));
         r.info
     }
 
@@ -359,7 +452,7 @@ impl Daemon {
             .collect())
     }
 
-    fn running(&self, rec: &PocketRecord) -> R<Arc<Live>> {
+    pub(crate) fn running(&self, rec: &PocketRecord) -> R<Arc<Live>> {
         self.live(&rec.info.id).ok_or_else(|| {
             err(
                 ErrorCode::InvalidState,
@@ -435,7 +528,40 @@ impl Daemon {
         }
         let injected = self.select_secrets(&req)?;
         let name = self.pick_name(&req, repo.as_ref().map(|r| r.toplevel.as_path()))?;
-        let id = hex(&random_bytes(8));
+        let shape = crate::templates::Shape {
+            vcpus: req.cpus.unwrap_or(DEFAULT_CPUS).clamp(1, 64),
+            memory_mib: req
+                .memory_mib
+                .unwrap_or(DEFAULT_MEMORY_MIB)
+                .clamp(256, 1 << 20),
+            disk_bytes: req
+                .disk_mib
+                .unwrap_or(DEFAULT_DISK_MIB)
+                .clamp(1024, 1 << 24)
+                << 20,
+        };
+        let net_mode = req.net_mode.clone().unwrap_or_else(|| "proxy".into());
+        // Shared folders need shared guest memory (no copy-on-write restore); a project
+        // setup builds its own template; full networking adds a NIC the template lacks.
+        let snapshot_eligible =
+            crate::templates::templates_enabled() && req.share.is_empty() && net_mode != "full";
+        let base_key = crate::templates::base_key(self, &image.digest, shape);
+        // A real secret copied in would end up in the snapshot's memory.
+        let project_key = req
+            .setup
+            .as_ref()
+            .filter(|_| snapshot_eligible && req.copy_secrets.is_empty())
+            .filter(|_| repo.as_ref().is_some_and(|r| r.head.is_some()))
+            .map(|s| crate::templates::project_key(&base_key, s));
+        let pooled = if snapshot_eligible && req.setup.is_none() {
+            self.pool.take(&base_key)
+        } else {
+            None
+        };
+        let id = match &pooled {
+            Some(p) => p.id.clone(),
+            None => hex(&random_bytes(8)),
+        };
         let cid = self.db(|s| s.free_cid())?;
         let now = now_ms();
         let rec = PocketRecord {
@@ -448,20 +574,16 @@ impl Daemon {
                 repo_path: repo.as_ref().map(|r| r.toplevel.clone()),
                 base_ref: repo.as_ref().and_then(|r| r.head.clone()),
                 branch: None,
-                vcpus: req.cpus.unwrap_or(DEFAULT_CPUS).clamp(1, 64),
-                memory_mib: req
-                    .memory_mib
-                    .unwrap_or(DEFAULT_MEMORY_MIB)
-                    .clamp(256, 1 << 20),
-                disk_bytes: req
-                    .disk_mib
-                    .unwrap_or(DEFAULT_DISK_MIB)
-                    .clamp(1024, 1 << 24)
-                    << 20,
+                vcpus: shape.vcpus,
+                memory_mib: shape.memory_mib,
+                disk_bytes: shape.disk_bytes,
                 disk_used_bytes: 0,
                 net_profile: profile,
                 created_at: now,
                 last_active_at: now,
+                started_from: None,
+                template: None,
+                net_mode: None,
             },
             vsock_cid: cid,
             vm_json: None,
@@ -477,6 +599,9 @@ impl Daemon {
                 git_allow_push: req.git_allow_push.clone(),
                 deny: req.deny.clone(),
                 shares: crate::share::validate(&req.share)?,
+                idle_pause_ms: req.idle_pause_ms,
+                idle_hibernate_ms: req.idle_hibernate_ms,
+                net_mode: Some(net_mode.clone()),
                 base_branch: repo.as_ref().and_then(|r| r.branch.clone()),
                 origin_host: repo
                     .as_ref()
@@ -496,6 +621,8 @@ impl Daemon {
         });
         let lock = self.op_lock(&id);
         let _g = lock.lock().await;
+        let mut restored = false;
+        let mut pooled = pooled;
         let result = async {
             let dir = self.paths.pocket_dir(&id);
             std::fs::create_dir_all(&dir).map_err(|e| {
@@ -515,9 +642,41 @@ impl Daemon {
                         key,
                     )
                 });
-            let from_template = template.as_ref().is_some_and(|(p, _)| p.exists());
-            progress("creating disk");
-            if let (true, Some((tpl, key))) = (from_template, &template) {
+            let project_snap = project_key
+                .as_deref()
+                .and_then(|k| crate::templates::find(self, k));
+            let from_template = project_snap.is_some()
+                || (project_key.is_none() && template.as_ref().is_some_and(|(p, _)| p.exists()));
+            let snap = match project_snap {
+                Some(t) => Some(t),
+                None => snapshot_eligible
+                    .then(|| crate::templates::find(self, &base_key))
+                    .flatten(),
+            };
+            if pooled.is_some() && snap.as_ref().is_none_or(|t| t.meta.key != base_key) {
+                // Template retired between claim and now: the pooled VM is stale.
+                pooled = None;
+            }
+            progress(if pooled.is_some() {
+                "claiming a warm VM"
+            } else {
+                "creating disk"
+            });
+            if let (Some(t), true) = (&snap, pooled.is_some()) {
+                let mut m = Self::meta(&rec);
+                m.snapshot_template = Some(t.meta.key.clone());
+                self.save_meta(&id, &m)?;
+                let _ = self.db(|s| s.touch_template(&t.meta.key, now_ms()));
+            } else if let Some(t) = &snap {
+                let mode = pocket_image::disk::clone_disk(&t.disk(), &dir.join("disk.raw"))
+                    .map_err(|e| err(ErrorCode::HostSetup, e.to_string()))?;
+                tracing::info!("{name}: disk from template {} via {mode:?}", t.meta.key);
+                let mut m = Self::meta(&rec);
+                m.snapshot_template = Some(t.meta.key.clone());
+                self.save_meta(&id, &m)?;
+                let _ = self.db(|s| s.touch_template(&t.meta.key, now_ms()));
+            } else if let (true, Some((tpl, key))) = (from_template, &template) {
+                // D24 disk template (pockets that cannot use snapshots).
                 let mode = pocket_image::disk::clone_disk(tpl, &dir.join("disk.raw"))
                     .map_err(|e| err(ErrorCode::HostSetup, e.to_string()))?;
                 tracing::info!("{name}: disk from project template {key} via {mode:?}");
@@ -533,9 +692,20 @@ impl Daemon {
                 .map_err(|e| err(ErrorCode::HostSetup, e.to_string()))?;
                 tracing::info!("{name}: disk via {mode:?}");
             }
-            progress("booting");
+            restored = snap.is_some();
+            if pooled.is_none() {
+                progress(if restored { "restoring" } else { "booting" });
+            }
             let rec = self.find(&name)?;
-            let live = self.boot(&rec, &image.path).await?;
+            let launch = match (pooled.take(), &snap) {
+                (Some(p), _) => {
+                    crate::pool::claimed(self, &p.id);
+                    Launch::Pool(p)
+                }
+                (None, Some(t)) => Launch::Template(t),
+                (None, None) => Launch::Cold,
+            };
+            let live = self.boot(&rec, &image.path, launch).await?;
             if let Some(info) = &repo {
                 let branch = if from_template {
                     progress("updating the template's repository");
@@ -548,7 +718,11 @@ impl Daemon {
             }
             if let (false, Some((tpl, key)), Some(setup)) = (from_template, &template, &req.setup) {
                 progress(&format!("running setup: {}", setup.command));
-                self.build_template(&live, setup, tpl, key).await?;
+                let snapshot = project_key
+                    .as_ref()
+                    .map(|k| (k.as_str(), shape, &image, preset.as_str()));
+                self.build_template(&live, setup, tpl, key, snapshot)
+                    .await?;
             }
             progress("starting session");
             self.create_session(
@@ -566,6 +740,10 @@ impl Daemon {
         match result {
             Ok(()) => {
                 self.set_state(&rec, PocketState::Running)?;
+                if snapshot_eligible && !restored {
+                    crate::templates::ensure_background(self, &preset, &image, shape);
+                }
+                self.pool.kick();
                 let r = self.find(&name)?;
                 Ok(self.info(r))
             }
@@ -587,39 +765,16 @@ impl Daemon {
         }
     }
 
-    /// Cold boot from the pocket's disk; returns once the guest is configured.
-    async fn boot(self: &Arc<Self>, rec: &PocketRecord, image: &Path) -> R<Arc<Live>> {
+    /// The VM spec of a pocket (shares are added by `boot`).
+    pub(crate) fn vm_spec(&self, rec: &PocketRecord, image: &Path) -> VmSpec {
         let id = &rec.info.id;
-        let rt = self.paths.pocket_runtime(id);
-        let _ = std::fs::remove_dir_all(&rt);
-        std::fs::create_dir_all(&rt).map_err(|e| {
-            err(
-                ErrorCode::HostSetup,
-                format!("create {}: {e}", rt.display()),
-            )
-        })?;
-        let disks = vec![
-            DiskSpec {
-                role: DiskRole::System,
-                path: self.paths.system_image(),
-                read_only: true,
-                transport: DiskTransport::Blk,
-            },
-            DiskSpec {
-                role: DiskRole::Base,
-                path: image.to_path_buf(),
-                read_only: true,
-                transport: DiskTransport::Pmem { dax: true },
-            },
-            DiskSpec {
-                role: DiskRole::Pocket,
-                path: self.paths.pocket_dir(id).join("disk.raw"),
-                read_only: false,
-                transport: DiskTransport::Blk,
-            },
-        ];
+        let disks = crate::templates::template_disks(
+            self,
+            image,
+            &self.paths.pocket_dir(id).join("disk.raw"),
+        );
         let dev = guest_devices(&disks);
-        let spec = VmSpec {
+        VmSpec {
             id: id.clone(),
             vcpus: rec.info.vcpus,
             memory_mib: rec.info.memory_mib,
@@ -637,13 +792,34 @@ impl Daemon {
                 memory_max_bytes: ((rec.info.memory_mib as u64) << 20) + VMM_OVERHEAD,
                 tasks_max: 4096,
             }),
-            runtime_dir: rt.clone(),
+            runtime_dir: self.paths.pocket_runtime(id),
             log_path: self.paths.pocket_dir(id).join("vmm.log"),
             serial_log: std::env::var_os("POCKET_SERIAL_LOG")
                 .map(|_| self.paths.pocket_dir(id).join("serial.log")),
             shared_fs: vec![],
-        };
-        let mut spec = spec;
+        }
+    }
+
+    /// Starts the pocket's VM from `launch`; returns once the restore hook ran (restores)
+    /// and the guest is configured.
+    pub(crate) async fn boot(
+        self: &Arc<Self>,
+        rec: &PocketRecord,
+        image: &Path,
+        launch: Launch<'_>,
+    ) -> R<Arc<Live>> {
+        let id = &rec.info.id;
+        let mut spec = self.vm_spec(rec, image);
+        let rt = spec.runtime_dir.clone();
+        if !matches!(launch, Launch::Pool(_)) {
+            let _ = std::fs::remove_dir_all(&rt);
+            std::fs::create_dir_all(&rt).map_err(|e| {
+                err(
+                    ErrorCode::HostSetup,
+                    format!("create {}: {e}", rt.display()),
+                )
+            })?;
+        }
         let meta = Self::meta(rec);
         let mut fs_tasks = vec![];
         for (i, sh) in meta.shares.iter().enumerate() {
@@ -662,12 +838,84 @@ impl Daemon {
         let mut tasks = net::listen(self, rec, &vsock_uds, proxy.clone())?;
         tasks.extend(fs_tasks);
         self.agent_listener(rec, &vsock_uds, &mut tasks)?;
-        let vm = self.backend.create(&spec).await.map_err(|e| {
-            err(ErrorCode::Vmm, e.to_string()).hint(format!("see {}", spec.log_path.display()))
-        })?;
+        let (kind, restore, configure) = match &launch {
+            Launch::Cold => ("cold", None, true),
+            Launch::Template(_) => ("template", Some(Restore::Clone), true),
+            Launch::Hibernation(_) => ("hibernation", Some(Restore::Own), false),
+            // The restore hook runs right after the resume below.
+            Launch::Pool(_) => ("pool", None, true),
+        };
+        let (vm, pre) = match launch {
+            Launch::Pool(p) => {
+                let (vm, guest, rx) = p.into_parts();
+                let mut m = Self::meta(rec);
+                let mid = m
+                    .machine_id
+                    .get_or_insert_with(|| hex(&random_bytes(16)))
+                    .clone();
+                m.restore_generation += 1;
+                let claim = std::time::Instant::now();
+                let hooked = async {
+                    self.backend
+                        .resume(&vm)
+                        .await
+                        .map_err(|e| err(ErrorCode::Vmm, e.to_string()))?;
+                    let resumed = claim.elapsed();
+                    restore_hook(
+                        &guest,
+                        &rec.info.name,
+                        &mid,
+                        m.restore_generation,
+                        Restore::Clone,
+                    )
+                    .await?;
+                    Ok::<_, RpcError>(resumed)
+                }
+                .await;
+                let resumed = match hooked {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let _ = self.backend.stop(&vm, StopMode::Kill).await;
+                        return Err(e);
+                    }
+                };
+                tracing::info!(
+                    "{}: pool claim ready in {:.2} ms (VMM resume {:.2} ms, restore hook {:.2} ms)",
+                    rec.info.name,
+                    claim.elapsed().as_secs_f64() * 1e3,
+                    resumed.as_secs_f64() * 1e3,
+                    (claim.elapsed() - resumed).as_secs_f64() * 1e3,
+                );
+                self.save_meta(id, &m)?;
+                (vm, Some((guest, rx)))
+            }
+            other => {
+                let vm = match &other {
+                    Launch::Template(t) => self.backend.restore(&t.snapshot(), &spec).await,
+                    Launch::Hibernation(snap) => self.backend.restore(snap, &spec).await,
+                    _ => self.backend.create(&spec).await,
+                }
+                .map_err(|e| {
+                    err(ErrorCode::Vmm, e.to_string())
+                        .hint(format!("see {}", spec.log_path.display()))
+                })?;
+                (vm, None)
+            }
+        };
         self.db(|s| s.set_vm(id, Some(&serde_json::to_string(&vm).unwrap())))?;
         let live = match self
-            .attach_guest(rec, vm.clone(), proxy, hooks, &mut tasks, true)
+            .attach_guest(
+                rec,
+                vm.clone(),
+                proxy,
+                hooks,
+                &mut tasks,
+                GuestSetup {
+                    configure,
+                    restore,
+                    pre,
+                },
+            )
             .await
         {
             Ok(l) => l,
@@ -679,6 +927,11 @@ impl Daemon {
                 return Err(e);
             }
         };
+        if let Ok(Some(r)) = self.db(|s| s.pocket(&rec.info.name)) {
+            let mut m = Self::meta(&r);
+            m.started_from = Some(kind.into());
+            let _ = self.save_meta(id, &m);
+        }
         Ok(live)
     }
 
@@ -689,12 +942,23 @@ impl Daemon {
         proxy: Arc<pocket_net::proxy::ProxyCtx>,
         hooks: Arc<PocketHooks>,
         tasks: &mut Vec<JoinHandle<()>>,
-        configure: bool,
+        how: GuestSetup,
     ) -> R<Arc<Live>> {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let guest = GuestConn::connect(&vm.vsock_uds, Duration::from_secs(15), tx)
-            .await
-            .map_err(|e| err(ErrorCode::Guest, format!("guest did not come up: {e}")))?;
+        let GuestSetup {
+            configure,
+            restore,
+            pre,
+        } = how;
+        let (guest, mut rx) = match pre {
+            Some(p) => p,
+            None => {
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                let g = GuestConn::connect(&vm.vsock_uds, Duration::from_secs(15), tx)
+                    .await
+                    .map_err(|e| err(ErrorCode::Guest, format!("guest did not come up: {e}")))?;
+                (g, rx)
+            }
+        };
         tracing::info!(
             "{}: guest ready (pocket-init {}, {:.1} ms after kernel start)",
             rec.info.name,
@@ -702,6 +966,25 @@ impl Daemon {
             guest.boot_ns as f64 / 1e6
         );
         let mut meta: Meta = serde_json::from_str(&rec.meta_json).unwrap_or_default();
+        let machine_id = meta
+            .machine_id
+            .get_or_insert_with(|| hex(&random_bytes(16)))
+            .clone();
+        if let Some(kind) = restore {
+            meta.restore_generation += 1;
+            restore_hook(
+                &guest,
+                &rec.info.name,
+                &machine_id,
+                meta.restore_generation,
+                kind,
+            )
+            .await?;
+            if !configure {
+                let mj = serde_json::to_string(&meta).unwrap();
+                self.db(|s| s.set_meta(&rec.info.id, &mj))?;
+            }
+        }
         if configure {
             let mut env = proxy_env();
             env.extend(provision::guest_env(&hooks));
@@ -720,6 +1003,7 @@ impl Daemon {
                         .unwrap_or(0),
                     env,
                     proxy_port: GUEST_PROXY_PORT,
+                    machine_id: machine_id.clone(),
                 })
                 .await
                 .map_err(|e| err(ErrorCode::Guest, format!("configure guest: {e}")))?;
@@ -759,6 +1043,7 @@ impl Daemon {
             hooks,
             host: crate::host::HostState::new(auto_forward),
             stopping: AtomicBool::new(false),
+            paused: AtomicBool::new(false),
             tasks: Mutex::new(std::mem::take(tasks)),
         });
         let d = self.clone();
@@ -853,15 +1138,39 @@ impl Daemon {
                     .adopt(&vm)
                     .await
                     .map_err(|e| err(ErrorCode::Vmm, e.to_string()))?;
+                if rec.info.state == PocketState::Paused {
+                    // A paused guest cannot accept the control connection; the idle manager
+                    // pauses it again if it stays idle.
+                    self.backend
+                        .resume(&vm)
+                        .await
+                        .map_err(|e| err(ErrorCode::Vmm, e.to_string()))?;
+                }
                 let (proxy, hooks) = self.egress(&rec)?;
                 let mut tasks = net::listen(self, &rec, &vm.vsock_uds, proxy.clone())?;
                 self.agent_listener(&rec, &vm.vsock_uds, &mut tasks)?;
-                self.attach_guest(&rec, vm, proxy, hooks, &mut tasks, false)
-                    .await
+                self.attach_guest(
+                    &rec,
+                    vm,
+                    proxy,
+                    hooks,
+                    &mut tasks,
+                    GuestSetup {
+                        configure: false,
+                        restore: None,
+                        pre: None,
+                    },
+                )
+                .await
             }
             .await;
             match result {
-                Ok(_) => tracing::info!("{}: re-adopted running VM", rec.info.name),
+                Ok(_) => {
+                    if rec.info.state == PocketState::Paused {
+                        let _ = self.set_state(&rec, PocketState::Running);
+                    }
+                    tracing::info!("{}: re-adopted running VM", rec.info.name)
+                }
                 Err(e) => {
                     let _ = self.db(|s| s.set_vm(&rec.info.id, None));
                     let _ = self.set_state(
@@ -880,11 +1189,12 @@ impl Daemon {
 
     /// Runs `setup` in `/work` and keeps the resulting disk as the project template.
     async fn build_template(
-        &self,
+        self: &Arc<Self>,
         live: &Live,
         setup: &pocket_proto::rpc::Setup,
         tpl: &Path,
         key: &str,
+        snapshot: Option<(&str, crate::templates::Shape, &crate::presets::Image, &str)>,
     ) -> R<()> {
         let started = std::time::Instant::now();
         let out = tokio::time::timeout(
@@ -932,6 +1242,27 @@ impl Daemon {
             "clean the template",
         )
         .await;
+        if let Some((pkey, shape, image, preset)) = snapshot {
+            let rec = self.find(&live.name)?;
+            match crate::templates::snapshot_pocket(
+                self, live, &rec, pkey, shape, image, preset, "project", None,
+            )
+            .await
+            {
+                Ok(()) => {
+                    let mut m = Self::meta(&self.find(&live.name)?);
+                    m.snapshot_template = Some(pkey.to_string());
+                    m.template = Some(key.to_string());
+                    let _ = self.save_meta(&live.id, &m);
+                    return Ok(());
+                }
+                Err(e) => tracing::warn!(
+                    "{}: project snapshot: {}; keeping a disk template",
+                    live.name,
+                    e.message
+                ),
+            }
+        }
         let disk = self.paths.pocket_dir(&live.id).join("disk.raw");
         let tmp = tpl.with_extension("tmp");
         let _ = std::fs::remove_file(&tmp);
@@ -1101,14 +1432,12 @@ impl Daemon {
         let rec = self.find(name)?;
         let lock = self.op_lock(&rec.info.id);
         let _g = lock.lock().await;
-        if self.live(&rec.info.id).is_some() {
-            return Err(err(
-                ErrorCode::InvalidState,
-                format!("pocket {} is already running", rec.info.name),
-            ));
+        if self.live(&rec.info.id).is_some() || rec.info.state == PocketState::Hibernated {
+            drop(_g);
+            return self.resume(&rec.info.name).await;
         }
         let image = presets::resolve(self, &rec.info.preset)?;
-        let live = self.boot(&rec, &image.path).await?;
+        let live = self.boot(&rec, &image.path, Launch::Cold).await?;
         self.create_session(&live, Some("shell"), None, 24, 80, None)
             .await?;
         self.set_state(&rec, PocketState::Running)?;
@@ -1117,6 +1446,9 @@ impl Daemon {
 
     async fn shutdown_live(&self, live: &Live) -> R<()> {
         live.stopping.store(true, Ordering::SeqCst);
+        if live.paused.load(Ordering::SeqCst) {
+            let _ = self.backend.resume(&live.vm).await;
+        }
         let asked = tokio::time::timeout(
             Duration::from_secs(8),
             live.guest.request_id(
@@ -1140,10 +1472,17 @@ impl Daemon {
         let rec = self.find(name)?;
         let lock = self.op_lock(&rec.info.id);
         let _g = lock.lock().await;
-        let live = self.running(&rec)?;
-        self.shutdown_live(&live).await?;
-        self.live.lock().unwrap().remove(&rec.info.id);
+        let rec = self.find(&rec.info.name)?;
+        if rec.info.state != PocketState::Hibernated {
+            let live = self.running(&rec)?;
+            self.shutdown_live(&live).await?;
+            self.live.lock().unwrap().remove(&rec.info.id);
+        }
         self.db(|s| s.set_vm(&rec.info.id, None))?;
+        crate::lifecycle::remove_hibernations(self, &rec.info.id, None);
+        let mut m = Self::meta(&rec);
+        m.hibernation = None;
+        self.save_meta(&rec.info.id, &m)?;
         self.set_state(&rec, PocketState::Stopped)?;
         Ok(self.info(self.find(&rec.info.name)?))
     }
@@ -1344,7 +1683,7 @@ impl Daemon {
     }
 
     pub async fn boot_builder(self: &Arc<Self>, rec: &PocketRecord, image: &Path) -> R<Arc<Live>> {
-        self.boot(rec, image).await
+        self.boot(rec, image, Launch::Cold).await
     }
 
     pub async fn stop_builder(&self, live: &Live) {
@@ -1375,6 +1714,35 @@ pub fn template_key(image: &str, s: &pocket_proto::rpc::Setup, disk_bytes: u64) 
     }
     h.update(disk_bytes.to_le_bytes());
     hex(&h.finalize()[..8])
+}
+
+/// The restore hook (CONTRACTS.md invariant): new RNG seed, clock and identity before the
+/// guest serves anything else. A sealed guest refuses sessions and execs until it ran.
+pub async fn restore_hook(
+    guest: &GuestConn,
+    hostname: &str,
+    machine_id: &str,
+    generation: u64,
+    kind: Restore,
+) -> R<()> {
+    guest
+        .request_id(
+            HostReq::Restored {
+                generation,
+                rng_seed: random_bytes(RNG_SEED_LEN),
+                time_unix_nanos: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0),
+                hostname: hostname.to_string(),
+                machine_id: machine_id.to_string(),
+                clone: kind == Restore::Clone,
+            },
+            Duration::from_secs(10),
+        )
+        .await
+        .map_err(|e| err(ErrorCode::Guest, format!("restore hook: {e}")))?;
+    Ok(())
 }
 
 pub fn guest_err(e: crate::guest::GuestConnError) -> RpcError {

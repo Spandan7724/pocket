@@ -1,14 +1,18 @@
 //! pocketd: the per-user daemon (ARCHITECTURE.md §3.2). Started on demand by `pocket`.
 
 mod agentcfg;
+mod bench;
+mod config;
 mod daemon;
 mod doctor;
 mod guard;
 mod guest;
 mod host;
 mod inject;
+mod lifecycle;
 mod net;
 mod paths;
+mod pool;
 mod presets;
 mod provision;
 mod review;
@@ -16,6 +20,7 @@ mod rpc;
 mod secrets;
 mod share;
 mod sshagent;
+mod templates;
 mod workspace;
 
 use std::os::fd::AsRawFd;
@@ -172,6 +177,8 @@ async fn run(paths: paths::Paths) -> ExitCode {
         d.backend.version()
     );
     d.readopt().await;
+    pool::spawn(&d);
+    lifecycle::spawn_idle_manager(&d);
     let stop = Arc::new(tokio::sync::Notify::new());
     let server = tokio::spawn(rpc::serve(d.clone(), listener, stop.clone()));
     let mut term =
@@ -184,6 +191,7 @@ async fn run(paths: paths::Paths) -> ExitCode {
     // VMs keep running in their own scopes; the next pocketd re-adopts them.
     tracing::info!("pocketd stopping; VMs keep running");
     server.abort();
+    pool::drain(&d).await;
     d.detach_all();
     let _ = std::fs::remove_file(&sock);
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;

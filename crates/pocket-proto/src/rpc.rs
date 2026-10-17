@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::guest::{ExitStatus, SessionInfo};
 
 /// Bump on every incompatible change to the types in this module.
-pub const RPC_VERSION: u32 = 2;
+pub const RPC_VERSION: u32 = 3;
 pub const MAX_RPC_FRAME: usize = 16 << 20;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -99,6 +99,17 @@ pub struct NewPocket {
     /// Host directories shared into the pocket over virtio-fs (explicit opt-in).
     #[serde(default)]
     pub share: Vec<ShareDir>,
+    /// `[idle]` thresholds; `None` = daemon default, `Some(0)` = never.
+    #[serde(default)]
+    pub idle_pause_ms: Option<u64>,
+    #[serde(default)]
+    pub idle_hibernate_ms: Option<u64>,
+    /// `proxy` (default), `transparent` (TUN shim, still policed) or `full` (passt NIC).
+    #[serde(default)]
+    pub net_mode: Option<String>,
+    /// Saved template (`pocket save --as NAME`) to start from.
+    #[serde(default)]
+    pub template: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -320,6 +331,33 @@ pub enum Request {
     Doctor,
     /// Stops the daemon (VMs keep running and are re-adopted on the next start).
     DaemonStop,
+    /// v3 (M9) below.
+    Templates,
+    /// Builds (or confirms) the snapshot template for a preset and VM shape.
+    TemplateBuild {
+        preset: String,
+        cpus: Option<u8>,
+        memory_mib: Option<u32>,
+    },
+    Pause {
+        pocket: String,
+    },
+    /// Resumes a paused or hibernated pocket.
+    Resume {
+        pocket: String,
+    },
+    Hibernate {
+        pocket: String,
+    },
+    Pool,
+    /// Start-path measurements (PERFORMANCE.md §4); the reply is a JSON report.
+    Bench {
+        runs: u32,
+        preset: String,
+        density: u32,
+        #[serde(default)]
+        memory_mib: Option<u32>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -356,6 +394,127 @@ pub enum Response {
         text: String,
         url: Option<String>,
     },
+    Templates(Vec<TemplateInfo>),
+    Pool(PoolInfo),
+    /// A JSON document (bench report).
+    Json(String),
+}
+
+/// Derived session state (CONTRACTS.md §4), from what the guest reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SessionState {
+    /// Output in the last 2 s.
+    Working,
+    /// An agent rang the bell / sent a notification after its last output, or sits quiet
+    /// at something that looks like a prompt.
+    Waiting,
+    Idle,
+    Exited,
+}
+
+const SHELLS: &[&str] = &[
+    "sh", "bash", "zsh", "fish", "dash", "ash", "ksh", "tcsh", "nu",
+];
+
+/// The session runs a shell (the default session) rather than an agent or other program.
+pub fn is_shell(argv: &[String]) -> bool {
+    let base = |a: &str| {
+        a.rsplit('/')
+            .next()
+            .unwrap_or(a)
+            .trim_start_matches('-')
+            .to_string()
+    };
+    match argv {
+        [] => true,
+        [first, rest @ ..] => {
+            SHELLS.contains(&base(first).as_str())
+                && (rest.is_empty()
+                    || rest[0] == "-l"
+                    || rest[0] == "-i"
+                    || rest.iter().any(|a| a.contains("${SHELL")))
+        }
+    }
+}
+
+fn looks_like_prompt(tail: &str) -> bool {
+    let t = tail.trim_end();
+    let lower = t.to_ascii_lowercase();
+    ["?", ">", "❯", "›", ":", "$", "#", "»"]
+        .iter()
+        .any(|p| t.ends_with(p))
+        || ["[y/n]", "(y/n)", "[y/n]:", "(yes/no)", "press enter"]
+            .iter()
+            .any(|p| lower.ends_with(p) || lower.contains(p))
+}
+
+pub fn session_state(s: &crate::guest::SessionInfo, now_ms: u64) -> SessionState {
+    if s.exited.is_some() {
+        return SessionState::Exited;
+    }
+    let out = s.last_output_unix_ms;
+    // A shell's bell is a beep (failed completion), not a question.
+    let agent = !is_shell(&s.argv);
+    if agent && s.last_bell_unix_ms > 0 && s.last_bell_unix_ms + 1500 >= out {
+        return SessionState::Waiting;
+    }
+    let quiet = now_ms.saturating_sub(out);
+    if out > 0 && quiet < 2000 {
+        return SessionState::Working;
+    }
+    if agent && out > 0 && quiet >= 3000 && looks_like_prompt(&s.tail) {
+        return SessionState::Waiting;
+    }
+    SessionState::Idle
+}
+
+/// `500ms`, `30s`, `30m`, `2h`, `1d`; `0` or `never` = disabled (`Some(0)`).
+pub fn parse_duration_ms(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if s == "never" || s == "0" {
+        return Some(0);
+    }
+    let split = s.find(|c: char| !c.is_ascii_digit())?;
+    let (n, unit) = s.split_at(split);
+    let n: u64 = n.parse().ok()?;
+    let mul = match unit {
+        "ms" => 1,
+        "s" => 1000,
+        "m" => 60_000,
+        "h" => 3_600_000,
+        "d" => 86_400_000,
+        _ => return None,
+    };
+    n.checked_mul(mul)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TemplateInfo {
+    pub key: String,
+    /// `base` (preset + VM shape), `project` (`sandbox.setup`), `saved` (`pocket save`).
+    pub kind: String,
+    pub name: Option<String>,
+    pub preset: String,
+    pub vcpus: u8,
+    pub memory_mib: u32,
+    pub disk_bytes: u64,
+    pub built_at: u64,
+    pub last_used_at: u64,
+    pub size_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct PoolInfo {
+    pub enabled: bool,
+    /// Target VMs for the hot template.
+    pub size: u32,
+    pub max_total_memory_mib: u64,
+    /// Template the pool fills for (most recently used).
+    pub template: Option<String>,
+    /// Paused, restored VMs ready to claim.
+    pub ready: u32,
+    pub memory_mib: u64,
+    pub claimed: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -423,6 +582,15 @@ pub struct PocketInfo {
     pub net_profile: String,
     pub created_at: u64,
     pub last_active_at: u64,
+    /// How the VM last started: `cold`, `template`, `pool`, `hibernation`.
+    #[serde(default)]
+    pub started_from: Option<String>,
+    /// Snapshot template the pocket was created from.
+    #[serde(default)]
+    pub template: Option<String>,
+    /// `proxy` (env proxy), `transparent` or `full` (passt NIC, unfiltered).
+    #[serde(default)]
+    pub net_mode: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -623,6 +791,54 @@ mod tests {
     use super::*;
 
     #[test]
+    fn session_states() {
+        use crate::guest::{PtySize, SessionInfo};
+        let s = |argv: &[&str], out: u64, bell: u64, tail: &str| SessionInfo {
+            name: "s".into(),
+            pid: 1,
+            argv: argv.iter().map(|a| a.to_string()).collect(),
+            created_unix_ms: 0,
+            size: PtySize { rows: 24, cols: 80 },
+            attached: 0,
+            exited: None,
+            last_output_unix_ms: out,
+            last_bell_unix_ms: bell,
+            tail: tail.into(),
+        };
+        let now = 100_000;
+        let shell = ["/bin/sh", "-c", "exec \"${SHELL:-/bin/sh}\" -l"];
+        assert!(is_shell(&shell.map(String::from)));
+        assert!(!is_shell(&["claude".to_string()]));
+        assert_eq!(
+            session_state(&s(&shell, now - 500, 0, ""), now),
+            SessionState::Working
+        );
+        assert_eq!(
+            session_state(&s(&shell, now - 9000, 0, "$ "), now),
+            SessionState::Idle
+        );
+        assert_eq!(
+            session_state(&s(&["claude"], now - 9000, now - 9000, ""), now),
+            SessionState::Waiting
+        );
+        assert_eq!(
+            session_state(
+                &s(&["codex"], now - 9000, 0, "Allow this command? [y/n]"),
+                now
+            ),
+            SessionState::Waiting
+        );
+        assert_eq!(
+            session_state(&s(&["codex"], now - 9000, 0, "compiling 3/9"), now),
+            SessionState::Idle
+        );
+        assert_eq!(
+            session_state(&s(&["claude"], now - 100, now - 60_000, ""), now),
+            SessionState::Working
+        );
+    }
+
+    #[test]
     fn roundtrip_and_limits() {
         let msgs = vec![
             ClientMsg::Hello {
@@ -655,6 +871,10 @@ mod tests {
                     git_allow_push: vec![],
                     setup: None,
                     share: vec![],
+                    idle_pause_ms: None,
+                    idle_hibernate_ms: None,
+                    net_mode: None,
+                    template: None,
                 }),
             },
             ClientMsg::Subscribe {

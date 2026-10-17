@@ -30,3 +30,4 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tar = { version = "0.4", default-features = false }
 flate2 = "1"
+toml_edit = { version = "0.23", default-features = false, features = ["parse", "display"] }

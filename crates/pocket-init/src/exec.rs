@@ -75,6 +75,10 @@ pub fn start(
     Ok(pid)
 }
 
+pub fn forget_all() {
+    EXECS.lock().unwrap_or_else(|e| e.into_inner()).take();
+}
+
 fn take(id: u64) -> Option<Entry> {
     EXECS
         .lock()

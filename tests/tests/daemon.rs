@@ -255,7 +255,10 @@ fn doctor_reports_checks_and_fixes() {
         );
     }
     assert!(
-        out.contains("guest protocol v3") && out.contains("cloud-hypervisor 54"),
+        out.contains(&format!(
+            "guest protocol v{}",
+            pocket_proto::guest::PROTO_VERSION
+        )) && out.contains("cloud-hypervisor 54"),
         "{out}"
     );
     let checks = env.json(&["doctor"]);

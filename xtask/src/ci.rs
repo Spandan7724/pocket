@@ -95,6 +95,7 @@ fn inner() -> Result {
         .env("POCKET_ASSETS_DIR", out())
         .env("POCKET_PRESET_CACHE", out().join("presets"))
         .args(["test", "--package", "pocket-tests", "--locked"]))?;
+    bench_gate()?;
     actionlint()?;
     fuzz_smoke(15)?;
     Ok(())
@@ -417,6 +418,39 @@ pub fn selftest() -> Result {
             "sleep + cloud-hypervisor"
         }
     );
+    Ok(())
+}
+
+/// `pocket bench` against `bench/baseline.json` (PERFORMANCE.md §4): fails on a p50 more
+/// than 10% (and more than a noise floor) slower than the baseline from the same CPU.
+fn bench_gate() -> Result {
+    step("bench gate");
+    if !Path::new("/dev/kvm").exists() {
+        eprintln!("SKIPPED: the bench needs /dev/kvm");
+        return Ok(());
+    }
+    let bin = root().join("target/debug");
+    let report = out().join("bench-latest.json");
+    run(Command::new(bin.join("pocket"))
+        .env("POCKET_ASSETS_DIR", out())
+        .env("POCKET_PRESET_CACHE", out().join("presets"))
+        .env("POCKETD", bin.join("pocketd"))
+        .args([
+            "bench",
+            "--preset",
+            "test",
+            "--runs",
+            "10",
+            "--density",
+            "0",
+        ])
+        .arg("--baseline")
+        .arg(root().join("bench/baseline.json"))
+        .arg("--out")
+        .arg(&report))?;
+    let _ = Command::new(bin.join("pocket"))
+        .args(["daemon", "stop"])
+        .status();
     Ok(())
 }
 

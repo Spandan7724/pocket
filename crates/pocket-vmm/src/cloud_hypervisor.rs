@@ -186,6 +186,57 @@ impl CloudHypervisor {
         }
     }
 
+    /// Starts `inner` (inside the pocket's scope when possible) and waits for its API.
+    async fn spawn(
+        &self,
+        spec: &VmSpec,
+        inner: Command,
+        api_socket: PathBuf,
+        vsock_uds: PathBuf,
+    ) -> Result<VmHandle, VmmError> {
+        let (mut cmd, unit) = match &spec.cgroup {
+            Some(cg) if cgroup::systemd_scopes_available() => {
+                (cgroup::wrap(cg, &inner), Some(cg.unit.clone()))
+            }
+            _ => {
+                let mut c = Command::new(inner.get_program());
+                c.args(inner.get_args());
+                (c, None)
+            }
+        };
+        let log = std::fs::File::create(&spec.log_path)
+            .map_err(VmmError::io(format!("create {}", spec.log_path.display())))?;
+        let log2 = log.try_clone().map_err(VmmError::io("dup log"))?;
+        // Own process group: a Ctrl-C aimed at a foreground daemon must not reach VMs.
+        let child = cmd
+            .stdin(Stdio::null())
+            .stdout(log)
+            .stderr(log2)
+            .process_group(0)
+            .spawn()
+            .map_err(|source| VmmError::Spawn {
+                binary: cmd.get_program().into(),
+                source,
+            })?;
+        let pid = child.id();
+        drop(child); // reaped by `wait_exit`
+        let start_time = process::start_time(pid).unwrap_or(0);
+        let h = VmHandle {
+            id: spec.id.clone(),
+            backend: NAME.into(),
+            pid,
+            start_time,
+            api_socket,
+            vsock_uds,
+            cgroup_unit: unit,
+        };
+        if let Err(e) = self.wait_api(&h, &spec.log_path).await {
+            let _ = self.kill(&h).await;
+            return Err(e);
+        }
+        Ok(h)
+    }
+
     async fn kill(&self, vm: &VmHandle) -> Result<(), VmmError> {
         process::kill(vm.pid, vm.start_time, libc::SIGKILL);
         process::wait_exit(vm.pid, vm.start_time)
@@ -205,6 +256,10 @@ impl VmmBackend for CloudHypervisor {
 
     fn version(&self) -> &str {
         &self.version
+    }
+
+    fn host_fingerprint(&self) -> HostFingerprint {
+        host_fingerprint(&self.version)
     }
 
     fn capabilities(&self) -> BackendCaps {
@@ -228,54 +283,49 @@ impl VmmBackend for CloudHypervisor {
             for s in [&ls.api_socket, &ls.vsock_uds] {
                 let _ = std::fs::remove_file(s);
             }
-            let inner = ls.command();
-            let (mut cmd, unit) = match &spec.cgroup {
-                Some(cg) if cgroup::systemd_scopes_available() => {
-                    (cgroup::wrap(cg, &inner), Some(cg.unit.clone()))
-                }
-                _ => {
-                    let mut c = Command::new(inner.get_program());
-                    c.args(inner.get_args());
-                    (c, None)
-                }
-            };
-            let log = std::fs::File::create(&spec.log_path)
-                .map_err(VmmError::io(format!("create {}", spec.log_path.display())))?;
-            let log2 = log.try_clone().map_err(VmmError::io("dup log"))?;
-            // Own process group: a Ctrl-C aimed at a foreground daemon must not reach VMs.
-            let child = cmd
-                .stdin(Stdio::null())
-                .stdout(log)
-                .stderr(log2)
-                .process_group(0)
-                .spawn()
-                .map_err(|source| VmmError::Spawn {
-                    binary: cmd.get_program().into(),
-                    source,
-                })?;
-            let pid = child.id();
-            drop(child); // reaped by `wait_exit`
-            let start_time = process::start_time(pid).unwrap_or(0);
-            let h = VmHandle {
-                id: spec.id.clone(),
-                backend: NAME.into(),
-                pid,
-                start_time,
-                api_socket: ls.api_socket,
-                vsock_uds: ls.vsock_uds,
-                cgroup_unit: unit,
-            };
-            if let Err(e) = self.wait_api(&h, &spec.log_path).await {
-                let _ = self.kill(&h).await;
-                return Err(e);
-            }
-            Ok(h)
+            self.spawn(spec, ls.command(), ls.api_socket, ls.vsock_uds)
+                .await
         })
     }
 
-    fn restore<'a>(&'a self, _snap: &'a SnapshotRef, _spec: &'a VmSpec) -> BoxFut<'a, VmHandle> {
-        // Template restore is the M9 start path.
-        Box::pin(async { Err(VmmError::Unsupported("restore")) })
+    fn restore<'a>(&'a self, snap: &'a SnapshotRef, spec: &'a VmSpec) -> BoxFut<'a, VmHandle> {
+        Box::pin(async move {
+            if snap.backend != NAME {
+                return Err(VmmError::Unsupported(
+                    "restoring another backend's snapshot",
+                ));
+            }
+            if snap.host_fingerprint != host_fingerprint(&self.version) {
+                return Err(VmmError::Unsupported(
+                    "restoring a snapshot taken on another host, kernel or VMM version",
+                ));
+            }
+            let ls = self.launch_spec(spec);
+            std::fs::create_dir_all(&spec.runtime_dir).map_err(VmmError::io(format!(
+                "create {}",
+                spec.runtime_dir.display()
+            )))?;
+            for s in [&ls.api_socket, &ls.vsock_uds] {
+                let _ = std::fs::remove_file(s);
+            }
+            let dir = spec.runtime_dir.join("restore");
+            prepare_restore_dir(&snap.dir, &dir, &ls)?;
+            let mode = if self.capabilities().lazy_restore && ls.fs.is_empty() {
+                "copyonwrite"
+            } else {
+                "copy"
+            };
+            let mut inner = Command::new(&self.binary);
+            inner
+                .arg("--api-socket")
+                .arg(&ls.api_socket)
+                .arg("--restore")
+                .arg(format!(
+                    "source_url=file://{},memory_restore_mode={mode},resume=true",
+                    dir.display()
+                ));
+            self.spawn(spec, inner, ls.api_socket, ls.vsock_uds).await
+        })
     }
 
     fn pause<'a>(&'a self, vm: &'a VmHandle) -> BoxFut<'a, ()> {
@@ -293,6 +343,11 @@ impl VmmBackend for CloudHypervisor {
             let body =
                 serde_json::json!({ "destination_url": format!("file://{}", dest.display()) });
             api_ok(&vm.api_socket, "vm.snapshot", Some(&body.to_string())).await?;
+            let mem = dest.join("memory-ranges");
+            tokio::task::spawn_blocking(move || crate::sparse::punch_zero_pages(&mem))
+                .await
+                .map_err(|e| VmmError::io("punch zero pages")(std::io::Error::other(e)))?
+                .map_err(VmmError::io("punch zero pages in the snapshot"))?;
             Ok(SnapshotRef {
                 dir: dest.to_path_buf(),
                 backend: NAME.into(),
@@ -372,6 +427,56 @@ impl VmmBackend for CloudHypervisor {
     fn vsock_uds(&self, vm: &VmHandle) -> PathBuf {
         vm.vsock_uds.clone()
     }
+}
+
+/// Per-VM copy of a snapshot directory: `config.json` rewritten to this VM's disks and
+/// vsock socket, `state.json` copied, the memory file linked (it is mapped, never written).
+fn prepare_restore_dir(src: &Path, dir: &Path, ls: &LaunchSpec) -> Result<(), VmmError> {
+    let _ = std::fs::remove_dir_all(dir);
+    std::fs::create_dir_all(dir).map_err(VmmError::io(format!("create {}", dir.display())))?;
+    let read = std::fs::read_to_string(src.join("config.json"))
+        .map_err(VmmError::io(format!("read {}/config.json", src.display())))?;
+    let mut cfg: serde_json::Value = serde_json::from_str(&read).map_err(|e| {
+        VmmError::io("parse snapshot config.json")(std::io::Error::other(e.to_string()))
+    })?;
+    rewrite_config(&mut cfg, ls)?;
+    std::fs::write(dir.join("config.json"), cfg.to_string())
+        .map_err(VmmError::io("write config.json"))?;
+    std::fs::copy(src.join("state.json"), dir.join("state.json"))
+        .map_err(VmmError::io(format!("copy {}/state.json", src.display())))?;
+    std::os::unix::fs::symlink(src.join("memory-ranges"), dir.join("memory-ranges"))
+        .map_err(VmmError::io("link memory-ranges"))?;
+    Ok(())
+}
+
+fn rewrite_config(cfg: &mut serde_json::Value, ls: &LaunchSpec) -> Result<(), VmmError> {
+    let bad = |what: &str| {
+        VmmError::io("snapshot config.json")(std::io::Error::other(format!(
+            "{what} does not match this VM"
+        )))
+    };
+    let disks = cfg["disks"]
+        .as_array_mut()
+        .ok_or_else(|| bad("disk list"))?;
+    if disks.len() != ls.disks.len() {
+        return Err(bad("disk count"));
+    }
+    for (d, new) in disks.iter_mut().zip(&ls.disks) {
+        if d["readonly"].as_bool().unwrap_or(false) != new.read_only {
+            return Err(bad("disk mode"));
+        }
+        d["path"] = serde_json::json!(new.path);
+    }
+    let pmem = cfg["pmem"].as_array_mut();
+    let n = pmem.as_ref().map_or(0, |p| p.len());
+    if n != ls.pmem.len() {
+        return Err(bad("pmem count"));
+    }
+    for (p, new) in pmem.into_iter().flatten().zip(&ls.pmem) {
+        p["file"] = serde_json::json!(new);
+    }
+    cfg["vsock"]["socket"] = serde_json::json!(ls.vsock_uds);
+    Ok(())
 }
 
 pub fn host_fingerprint(vmm_version: &str) -> HostFingerprint {

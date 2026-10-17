@@ -38,8 +38,13 @@ impl Env {
                 bin_dir().join(b).display()
             );
         }
-        // Never touch the user's keyring from tests.
-        let mut extra = vec![("POCKET_SECRET_STORE".to_string(), "file".to_string())];
+        // Never touch the user's keyring from tests. Snapshot templates and the warm pool
+        // are opt-in (`with_templates`): a snapshot briefly writes all guest RAM to disk.
+        let mut extra = vec![
+            ("POCKET_SECRET_STORE".to_string(), "file".to_string()),
+            ("POCKET_TEMPLATES".to_string(), "off".to_string()),
+            ("POCKET_POOL_SIZE".to_string(), "0".to_string()),
+        ];
         if let Some(c) = std::env::var_os("POCKET_PRESET_CACHE") {
             extra.push((
                 "POCKET_PRESET_CACHE".into(),
@@ -55,6 +60,49 @@ impl Env {
             root,
             assets: assets.to_path_buf(),
             extra,
+        }
+    }
+
+    /// Enables snapshot templates and a warm pool of `pool` VMs.
+    pub fn with_templates(mut self, pool: u32) -> Env {
+        self.extra
+            .retain(|(k, _)| k != "POCKET_TEMPLATES" && k != "POCKET_POOL_SIZE");
+        self.extra
+            .push(("POCKET_POOL_SIZE".into(), pool.to_string()));
+        self
+    }
+
+    pub fn set(mut self, k: &str, v: &str) -> Env {
+        self.extra.retain(|(key, _)| key != k);
+        self.extra.push((k.into(), v.into()));
+        self
+    }
+
+    /// Polls `pocket --json templates` until `ok` holds (templates build in the background).
+    pub fn wait_templates(
+        &self,
+        what: &str,
+        timeout: std::time::Duration,
+        ok: impl Fn(&serde_json::Value) -> bool,
+    ) -> serde_json::Value {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let o = self
+                .cmd("pocket")
+                .args(["--json", "templates"])
+                .output()
+                .unwrap();
+            let v: serde_json::Value =
+                serde_json::from_slice(&o.stdout).unwrap_or(serde_json::Value::Null);
+            if ok(&v) {
+                return v;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {what}: {v}\n{}",
+                self.log()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(100));
         }
     }
 

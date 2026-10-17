@@ -83,7 +83,7 @@ async fn splice(mut tcp: tokio::net::TcpStream, uds: std::path::PathBuf, port: u
 impl Daemon {
     /// Forwards host `127.0.0.1:<host>` (or a free port when taken and `auto`) to the guest.
     pub async fn forward_port(
-        &self,
+        self: &Arc<Self>,
         live: &Arc<Live>,
         guest: u16,
         host: Option<u16>,
@@ -109,9 +109,22 @@ impl Daemon {
         };
         let hp = l.local_addr().map(|a| a.port()).unwrap_or(want);
         let uds = live.vm.vsock_uds.clone();
+        let activity = self.activity(&live.id);
+        let (d, name) = (Arc::downgrade(self), live.name.clone());
         let task = tokio::spawn(async move {
             while let Ok((tcp, _)) = l.accept().await {
-                tokio::spawn(splice(tcp, uds.clone(), guest));
+                let busy = activity.begin();
+                let (uds, d, name) = (uds.clone(), d.clone(), name.clone());
+                tokio::spawn(async move {
+                    let _busy = busy;
+                    // A connection to a paused pocket's port resumes it.
+                    if let Some(d) = d.upgrade()
+                        && let Err(e) = d.wake(&name).await
+                    {
+                        tracing::warn!("{name}: resume for port {guest}: {}", e.message);
+                    }
+                    splice(tcp, uds, guest).await
+                });
             }
         });
         let info = PortInfo {
@@ -213,7 +226,14 @@ impl Daemon {
         }
     }
 
-    fn notice(&self, live: &Live, session: Option<String>, kind: &str, title: &str, body: &str) {
+    pub(crate) fn notice(
+        &self,
+        live: &Live,
+        session: Option<String>,
+        kind: &str,
+        title: &str,
+        body: &str,
+    ) {
         self.emit(Event::Notice {
             pocket: live.name.clone(),
             session,

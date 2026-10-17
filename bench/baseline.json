@@ -1,0 +1,99 @@
+{
+  "host": {
+    "cpu_flags_hash": "280382ee3f2cce60",
+    "cpu_model": "Intel(R) Core(TM) i9-14900HX",
+    "host_kernel": "7.2.7-arch1-1",
+    "vmm_version": "cloud-hypervisor 54.0.0"
+  },
+  "image": "sha256:c5ca053cfe1d85c5b96dff8b9bc57045f7f184a30ffb6b65776409ca90388677",
+  "metrics": {
+    "attach_rtt_added_us": {
+      "max": 376.72,
+      "min": 19.35,
+      "n": 1000,
+      "p50": 23.67,
+      "p95": 33.83
+    },
+    "attach_rtt_us": {
+      "max": 399.61,
+      "min": 42.24,
+      "n": 1000,
+      "p50": 46.56,
+      "p95": 56.72
+    },
+    "cold_boot_ms": {
+      "max": 147.9,
+      "min": 117.21,
+      "n": 10,
+      "p50": 128.05,
+      "p95": 143.34
+    },
+    "hibernate_image_mib": {
+      "max": 49.0,
+      "min": 49.0,
+      "n": 10,
+      "p50": 49.0,
+      "p95": 49.0
+    },
+    "hibernate_resume_ms": {
+      "max": 51.09,
+      "min": 35.88,
+      "n": 10,
+      "p50": 45.81,
+      "p95": 50.57
+    },
+    "hibernate_write_ms": {
+      "max": 255.3,
+      "min": 228.73,
+      "n": 10,
+      "p50": 233.09,
+      "p95": 247.04
+    },
+    "local_pty_rtt_us": {
+      "max": 105.82,
+      "min": 19.68,
+      "n": 1000,
+      "p50": 22.89,
+      "p95": 26.11
+    },
+    "new_e2e_ms": {
+      "max": 62.44,
+      "min": 38.62,
+      "n": 10,
+      "p50": 43.39,
+      "p95": 60.33
+    },
+    "pool_claim_ms": {
+      "max": 6.29,
+      "min": 2.99,
+      "n": 10,
+      "p50": 3.64,
+      "p95": 5.31
+    },
+    "pool_resume_api_ms": {
+      "max": 2.39,
+      "min": 1.81,
+      "n": 10,
+      "p50": 2.1,
+      "p95": 2.38
+    },
+    "restore_ms": {
+      "max": 72.96,
+      "min": 35.36,
+      "n": 10,
+      "p50": 54.88,
+      "p95": 70.53
+    }
+  },
+  "preset": "test",
+  "runs": 10,
+  "shape": {
+    "memory_mib": 512,
+    "vcpus": 2
+  },
+  "template": {
+    "key": "f4f31f47fcb32750cdfe",
+    "size_mib": 516
+  },
+  "version": 1
+}

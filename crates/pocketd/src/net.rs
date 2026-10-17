@@ -165,10 +165,13 @@ pub fn listen(
 ) -> R<Vec<JoinHandle<()>>> {
     let mut tasks = vec![];
     let l = bind(&host_listener_path(vsock_uds, PROXY_PORT))?;
+    let activity = d.activity(&rec.info.id);
     tasks.push(tokio::spawn(async move {
         while let Ok((mut s, _)) = l.accept().await {
             let ctx = proxy.clone();
+            let busy = activity.begin();
             tokio::spawn(async move {
+                let _busy = busy;
                 match first_frame::<ProxyOpen>(&mut s).await {
                     Some(ProxyOpen::HttpProxy) => pocket_net::proxy::serve(s, ctx).await,
                     other => tracing::warn!("{}: rejected proxy stream {other:?}", ctx.pocket),

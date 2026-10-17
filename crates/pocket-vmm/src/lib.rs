@@ -3,6 +3,7 @@
 pub mod cgroup;
 pub mod cloud_hypervisor;
 pub mod process;
+pub mod sparse;
 pub mod vsock;
 
 use std::future::Future;
@@ -175,6 +176,8 @@ pub trait VmmBackend: Send + Sync {
     fn name(&self) -> &'static str;
     fn version(&self) -> &str;
     fn capabilities(&self) -> BackendCaps;
+    /// What a snapshot taken now is tied to (CPU, host kernel, VMM version).
+    fn host_fingerprint(&self) -> HostFingerprint;
 
     /// Cold boot.
     fn create<'a>(&'a self, spec: &'a VmSpec) -> BoxFut<'a, VmHandle>;

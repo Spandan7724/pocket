@@ -70,6 +70,9 @@ fn owner(inode: u64) -> Option<String> {
     None
 }
 
+/// Set by the restore hook: the host lost its forwards, announce every port again.
+pub static REANNOUNCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Starts the watcher once; `skip` are pocket's own listeners (the proxy shim).
 pub fn start_watcher(skip: Vec<u16>) {
     if STARTED.set(()).is_err() {
@@ -78,6 +81,9 @@ pub fn start_watcher(skip: Vec<u16>) {
     std::thread::spawn(move || {
         let mut known: BTreeSet<u16> = BTreeSet::new();
         loop {
+            if REANNOUNCE.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                known.clear();
+            }
             let now = listening(&skip);
             let ports: BTreeSet<u16> = now.iter().map(|(p, _)| *p).collect();
             for &(port, inode) in now.iter() {

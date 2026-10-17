@@ -35,6 +35,7 @@ const PRESETS: &[Preset] = &[Preset {
 /// Minimal Alpine image from the assets dir, for tests (no git, root only).
 pub const TEST_PRESET: &str = "test";
 
+#[derive(Clone)]
 pub struct Image {
     pub path: PathBuf,
     pub digest: String,
@@ -217,6 +218,9 @@ async fn build(
             net_profile: "dev".into(),
             created_at: now_ms(),
             last_active_at: now_ms(),
+            started_from: None,
+            template: None,
+            net_mode: None,
         },
         vsock_cid: 3,
         vm_json: None,

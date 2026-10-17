@@ -2,6 +2,7 @@
 //! bytes go straight to the pocket's vsock socket.
 
 mod attach;
+mod bench;
 mod client;
 mod diff;
 mod error;
@@ -126,6 +127,14 @@ enum Cmd {
     },
     /// List a pocket's sessions.
     Sessions { pocket: String },
+    /// Start a command as a new named session without attaching (e.g. `-- claude`).
+    RunIn {
+        pocket: String,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
+    },
     /// Kill a session (POCKET:SESSION); an exited session is forgotten.
     Kill {
         target: String,
@@ -134,8 +143,35 @@ enum Cmd {
     },
     /// Shut a pocket down (disk kept).
     Stop { pocket: String },
-    /// Boot a stopped pocket.
+    /// Boot a stopped pocket (or resume a paused / hibernated one).
     Start { pocket: String },
+    /// Freeze a pocket's vCPUs (memory stays; resumes in milliseconds).
+    Pause { pocket: String },
+    /// Resume a paused or hibernated pocket.
+    Resume { pocket: String },
+    /// Snapshot a pocket to disk and free its memory; `resume` or any use brings it back.
+    Hibernate { pocket: String },
+    /// List snapshot templates and the warm pool.
+    Templates,
+    /// Measure start paths, density and attach latency (JSON with --json).
+    Bench {
+        #[arg(long, default_value_t = 20)]
+        runs: u32,
+        #[arg(long, default_value = "base")]
+        preset: String,
+        /// Idle VMs for the density measurement (0 = skip).
+        #[arg(long, default_value_t = 10)]
+        density: u32,
+        /// Guest memory of the measured VMs (default: the `pocket new` default).
+        #[arg(long)]
+        mem: Option<String>,
+        /// Fail (exit 1) when a p50 is >10% slower than this report from the same host.
+        #[arg(long)]
+        baseline: Option<PathBuf>,
+        /// Also write the JSON report here.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
     /// Remove pockets with their disks.
     Rm {
         #[arg(required = true)]
@@ -407,6 +443,13 @@ fn glyph(state: &str) -> &'static str {
         "creating" => "…",
         _ => "⚠",
     }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn print_pockets(list: &[PocketInfo]) {
@@ -768,6 +811,10 @@ fn command(c: &mut Client, cmd: Cmd, j: bool) -> Result<u8> {
                 git_allow_push: vec![],
                 setup: None,
                 share,
+                idle_pause_ms: None,
+                idle_hibernate_ms: None,
+                net_mode: None,
+                template: None,
             };
             let mut req = req;
             if let Some(repo) = req.repo.clone()
@@ -871,20 +918,41 @@ fn command(c: &mut Client, cmd: Cmd, j: bool) -> Result<u8> {
             let Response::Sessions(list) = c.request(Request::SessionList { pocket: p })? else {
                 return Err(CliError::new("internal", 70, "unexpected reply"));
             };
+            let now = now_ms();
+            let states: Vec<_> = list
+                .iter()
+                .map(|s| pocket_proto::rpc::session_state(s, now))
+                .collect();
             if j {
-                json(&list);
+                let v: Vec<serde_json::Value> = list
+                    .iter()
+                    .zip(&states)
+                    .map(|(s, st)| {
+                        let mut v = serde_json::to_value(s).unwrap();
+                        v["state"] = serde_json::to_value(st).unwrap();
+                        v
+                    })
+                    .collect();
+                json(&v);
             } else {
                 println!(
-                    "{:<16} {:<12} {:>7} {:>8}  COMMAND",
+                    "{:<16} {:<18} {:>7} {:>8}  COMMAND",
                     "SESSION", "STATE", "PID", "CLIENTS"
                 );
-                for s in list {
-                    let state = match s.exited {
-                        Some(st) => format!("✗ exit {}", st.code()),
-                        None => "● running".into(),
+                for (s, st) in list.iter().zip(&states) {
+                    use pocket_proto::rpc::SessionState as S;
+                    let state = match (st, s.exited) {
+                        (_, Some(e)) => format!(
+                            "{} exit {}",
+                            if e.code() == 0 { "✓" } else { "✗" },
+                            e.code()
+                        ),
+                        (S::Working, _) => "● working".into(),
+                        (S::Waiting, _) => "○ waiting for input".into(),
+                        _ => "· idle".into(),
                     };
                     println!(
-                        "{:<16} {:<12} {:>7} {:>8}  {}",
+                        "{:<16} {:<18} {:>7} {:>8}  {}",
                         s.name,
                         state,
                         s.pid,
@@ -892,6 +960,31 @@ fn command(c: &mut Client, cmd: Cmd, j: bool) -> Result<u8> {
                         s.argv.join(" ")
                     );
                 }
+            }
+            Ok(0)
+        }
+        Cmd::RunIn {
+            pocket,
+            name,
+            command,
+        } => {
+            let p = resolve_pocket(c, &pocket)?;
+            let (rows, cols) = term::size();
+            let Response::Session { name } = c.request(Request::SessionCreate {
+                pocket: p.clone(),
+                name,
+                argv: Some(command),
+                rows,
+                cols,
+                term: std::env::var("TERM").ok(),
+            })?
+            else {
+                return Err(CliError::new("internal", 70, "unexpected reply"));
+            };
+            if j {
+                json(&serde_json::json!({ "pocket": p, "session": name }));
+            } else {
+                println!("started {p}:{name} — attach with `pocket attach {p}:{name}`");
             }
             Ok(0)
         }
@@ -932,6 +1025,108 @@ fn command(c: &mut Client, cmd: Cmd, j: bool) -> Result<u8> {
             } else {
                 println!("stopped {}", info.name)
             }
+            Ok(0)
+        }
+        Cmd::Pause { ref pocket } | Cmd::Resume { ref pocket } | Cmd::Hibernate { ref pocket } => {
+            let pocket = resolve_pocket(c, pocket)?;
+            let (req, verb) = match cmd {
+                Cmd::Pause { .. } => (Request::Pause { pocket }, "paused"),
+                Cmd::Resume { .. } => (Request::Resume { pocket }, "resumed"),
+                _ => (Request::Hibernate { pocket }, "hibernated"),
+            };
+            let started = std::time::Instant::now();
+            let Response::Pocket(info) = c.request(req)? else {
+                return Err(CliError::new("internal", 70, "unexpected reply"));
+            };
+            if j {
+                json(&info)
+            } else {
+                println!(
+                    "{verb} {} in {:.0} ms",
+                    info.name,
+                    started.elapsed().as_secs_f64() * 1e3
+                )
+            }
+            Ok(0)
+        }
+        Cmd::Bench {
+            runs,
+            preset,
+            density,
+            mem,
+            baseline,
+            out,
+        } => {
+            let mem = mem
+                .as_deref()
+                .map(parse_size_mib)
+                .transpose()?
+                .map(|m| m as u32);
+            let report = bench::run(c, runs, &preset, density, mem, progress_printer(j))?;
+            if let Some(o) = &out {
+                std::fs::write(o, serde_json::to_string_pretty(&report).unwrap())
+                    .map_err(|e| CliError::io(&format!("write {}", o.display()), e))?;
+            }
+            if j {
+                json(&report);
+            } else {
+                bench::print(&report);
+            }
+            if let Some(b) = baseline {
+                let reg = bench::regressions(&report, &b)?;
+                if !reg.is_empty() {
+                    for r in &reg {
+                        eprintln!("✗ regression: {r}");
+                    }
+                    return Ok(1);
+                }
+                eprintln!("✓ no regression > 10% against {}", b.display());
+            }
+            Ok(0)
+        }
+        Cmd::Templates => {
+            let Response::Templates(list) = c.request(Request::Templates)? else {
+                return Err(CliError::new("internal", 70, "unexpected reply"));
+            };
+            let Response::Pool(pool) = c.request(Request::Pool)? else {
+                return Err(CliError::new("internal", 70, "unexpected reply"));
+            };
+            if j {
+                json(&serde_json::json!({ "templates": list, "pool": pool }));
+                return Ok(0);
+            }
+            if list.is_empty() {
+                println!("no templates yet — the first `pocket new` of a preset builds one");
+            } else {
+                println!(
+                    "{:<22} {:<8} {:<10} {:>4} {:>7} {:>8}  BUILT",
+                    "KEY", "KIND", "PRESET", "CPUS", "MEM", "SIZE"
+                );
+                for t in &list {
+                    println!(
+                        "{:<22} {:<8} {:<10} {:>4} {:>7} {:>8}  {}",
+                        t.name.clone().unwrap_or_else(|| t.key.clone()),
+                        t.kind,
+                        t.preset,
+                        t.vcpus,
+                        format!("{}M", t.memory_mib),
+                        human_bytes(t.size_bytes),
+                        ago(t.built_at)
+                    );
+                }
+            }
+            println!(
+                "pool: {} ({} of {} ready, {} MiB of {} MiB cap{})",
+                if pool.enabled { "on" } else { "off" },
+                pool.ready,
+                pool.size,
+                pool.memory_mib,
+                pool.max_total_memory_mib,
+                pool.template
+                    .as_deref()
+                    .map(|t| format!(", template {t}"))
+                    .unwrap_or_default()
+            );
             Ok(0)
         }
         Cmd::Start { pocket } => {

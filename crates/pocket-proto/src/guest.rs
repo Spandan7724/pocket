@@ -15,7 +15,7 @@ use crate::frame::Validate;
 use crate::{ProtoError, invalid};
 
 /// Bump on every change to the types in this module.
-pub const PROTO_VERSION: u32 = 3;
+pub const PROTO_VERSION: u32 = 5;
 
 pub const CONTROL_PORT: u32 = 1024;
 pub const STREAM_PORT: u32 = 1025;
@@ -28,6 +28,8 @@ pub const MAX_NOTIFY_TITLE: usize = 256;
 pub const MAX_NOTIFY_BODY: usize = 1024;
 
 pub const RNG_SEED_LEN: usize = 64;
+/// `/etc/machine-id` format: 32 lowercase hex digits.
+pub const MACHINE_ID_LEN: usize = 32;
 pub const ATTACH_TOKEN_LEN: usize = 32;
 /// Guest-side lifetime of an unused attach token.
 pub const ATTACH_TOKEN_TTL_MS: u64 = 30_000;
@@ -84,6 +86,7 @@ pub enum HostReq {
         time_unix_nanos: u128,
         env: Vec<(String, String)>,
         proxy_port: u16,
+        machine_id: String,
     },
     /// The request id doubles as the exec id for [`StreamOpen::ExecIo`]. `user` is a
     /// guest account name (`None` = root).
@@ -124,12 +127,20 @@ pub enum HostReq {
         mode: u32,
         data: Vec<u8>,
     },
+    /// Restore hook: first request after a restore (template clone, hibernation, pool).
+    /// `clone` = the VM takes a new identity; sessions and processes from before are killed.
     Restored {
         generation: u64,
         rng_seed: Vec<u8>,
         time_unix_nanos: u128,
         hostname: String,
+        machine_id: String,
+        clone: bool,
     },
+    /// Sent before a snapshot: until the next `Restored`, the guest refuses `Configure`,
+    /// `Exec`, `SessionCreate` and `AuthorizeAttach`, so a restored VM runs nothing for a
+    /// user before the restore hook.
+    Seal,
     /// SIGTERM everything, SIGKILL after `timeout_ms`, unmount cleanly, reply, power off.
     Shutdown {
         timeout_ms: u32,
@@ -174,7 +185,15 @@ pub struct SessionInfo {
     pub size: PtySize,
     pub attached: u32,
     pub exited: Option<ExitStatus>,
+    /// Last PTY output (0 = none yet); drives idle detection and session states.
+    pub last_output_unix_ms: u64,
+    /// Last bell / OSC 9 / OSC 777 from the session (an agent asking for attention).
+    pub last_bell_unix_ms: u64,
+    /// Last line of output, escape sequences stripped (≤ [`MAX_TAIL`] bytes): prompt check.
+    pub tail: String,
 }
+
+pub const MAX_TAIL: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ErrorKind {
@@ -372,6 +391,10 @@ pub fn valid_hostname(s: &str) -> bool {
         })
 }
 
+pub fn valid_machine_id(s: &str) -> bool {
+    s.len() == MACHINE_ID_LEN && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 fn check(ok: bool, what: &str) -> Result<(), ProtoError> {
     if ok { Ok(()) } else { Err(invalid(what)) }
 }
@@ -450,9 +473,11 @@ impl Validate for HostMsg {
                 hostname,
                 rng_seed,
                 env: e,
+                machine_id,
                 ..
             } => {
                 check(valid_hostname(hostname), "invalid hostname")?;
+                check(valid_machine_id(machine_id), "invalid machine id")?;
                 seed(rng_seed)?;
                 env(e)
             }
@@ -500,12 +525,16 @@ impl Validate for HostMsg {
                 check(data.len() <= MAX_FILE, "file too large")
             }
             HostReq::Restored {
-                rng_seed, hostname, ..
+                rng_seed,
+                hostname,
+                machine_id,
+                ..
             } => {
                 seed(rng_seed)?;
+                check(valid_machine_id(machine_id), "invalid machine id")?;
                 check(valid_hostname(hostname), "invalid hostname")
             }
-            HostReq::Shutdown { .. } => Ok(()),
+            HostReq::Seal | HostReq::Shutdown { .. } => Ok(()),
         }
     }
 }
@@ -533,6 +562,10 @@ impl Validate for GuestMsg {
                     check(list.len() <= MAX_SESSIONS, "too many sessions")?;
                     for s in list {
                         check(valid_name(&s.name), "invalid session name")?;
+                        check(
+                            s.tail.len() <= MAX_TAIL && !s.tail.chars().any(char::is_control),
+                            "invalid session tail",
+                        )?;
                         argv(&s.argv)?;
                         size(&s.size)?;
                         s.exited.as_ref().map_or(Ok(()), status)?;
@@ -744,6 +777,7 @@ mod tests {
                 time_unix_nanos: 1_760_000_000_000_000_000,
                 env: env.clone(),
                 proxy_port: 3128,
+                machine_id: "0123456789abcdef0123456789abcdef".into(),
             },
             HostReq::Exec {
                 argv: vec!["sh".into(), "-c".into(), "true".into()],
@@ -783,7 +817,10 @@ mod tests {
                 rng_seed: seed64(),
                 time_unix_nanos: u128::MAX,
                 hostname: "a".into(),
+                machine_id: "fedcba9876543210fedcba9876543210".into(),
+                clone: true,
             },
+            HostReq::Seal,
             HostReq::Shutdown { timeout_ms: 2000 },
         ];
         roundtrip(HostMsg::Hello {
@@ -823,6 +860,9 @@ mod tests {
                     size: sz(),
                     attached: 1,
                     exited: Some(ExitStatus::Signal(9)),
+                    last_output_unix_ms: 2,
+                    last_bell_unix_ms: 1,
+                    tail: "$ ".into(),
                 }])),
             },
             GuestMsg::Reply {

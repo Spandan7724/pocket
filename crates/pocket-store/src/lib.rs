@@ -88,6 +88,11 @@ const MIGRATIONS: &[&str] = &[
         built_at INTEGER NOT NULL,
         size_bytes INTEGER NOT NULL
     );",
+    // 2: snapshot templates (M9): kind base|project|saved, family = what a newer key replaces
+    "ALTER TABLE templates ADD COLUMN kind TEXT NOT NULL DEFAULT 'base';
+    ALTER TABLE templates ADD COLUMN family TEXT NOT NULL DEFAULT '';
+    ALTER TABLE templates ADD COLUMN name TEXT;
+    ALTER TABLE templates ADD COLUMN meta_json TEXT NOT NULL DEFAULT '{}';",
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -126,6 +131,22 @@ pub struct ImageRecord {
     pub source: String,
     pub built_at: u64,
     pub size_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TemplateRecord {
+    pub key: String,
+    pub kind: String,
+    /// Templates of one family differ only in their key inputs; a new key replaces the old.
+    pub family: String,
+    /// Set for `pocket save --as NAME`.
+    pub name: Option<String>,
+    pub image_digest: String,
+    pub built_at: u64,
+    pub host_fingerprint: String,
+    pub size_bytes: u64,
+    pub last_used_at: u64,
+    pub meta_json: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -197,6 +218,9 @@ fn pocket_row(r: &Row) -> rusqlite::Result<(PocketRecord, String, Option<String>
             net_profile: r.get(12)?,
             created_at: r.get::<_, i64>(13)? as u64,
             last_active_at: r.get::<_, i64>(14)? as u64,
+            started_from: None,
+            template: None,
+            net_mode: None,
         },
         vsock_cid: r.get(15)?,
         vm_json: r.get(16)?,
@@ -497,6 +521,63 @@ impl Store {
             > 0)
     }
 
+    pub fn put_template(&self, t: &TemplateRecord) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO templates (key, kind, family, name, image_digest, built_at, \
+             host_fingerprint, size_bytes, last_used_at, meta_json) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            params![
+                t.key,
+                t.kind,
+                t.family,
+                t.name,
+                t.image_digest,
+                t.built_at as i64,
+                t.host_fingerprint,
+                t.size_bytes as i64,
+                t.last_used_at as i64,
+                t.meta_json
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn templates(&self) -> Result<Vec<TemplateRecord>> {
+        let mut st = self.conn.prepare(
+            "SELECT key, kind, family, name, image_digest, built_at, host_fingerprint, \
+             size_bytes, last_used_at, meta_json FROM templates ORDER BY built_at",
+        )?;
+        let rows = st.query_map([], |r| {
+            Ok(TemplateRecord {
+                key: r.get(0)?,
+                kind: r.get(1)?,
+                family: r.get(2)?,
+                name: r.get(3)?,
+                image_digest: r.get(4)?,
+                built_at: r.get::<_, i64>(5)? as u64,
+                host_fingerprint: r.get(6)?,
+                size_bytes: r.get::<_, i64>(7)? as u64,
+                last_used_at: r.get::<_, i64>(8)? as u64,
+                meta_json: r.get(9)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    pub fn touch_template(&self, key: &str, now: u64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE templates SET last_used_at = ?2 WHERE key = ?1",
+            params![key, now as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_template(&self, key: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM templates WHERE key = ?1", [key])?;
+        Ok(())
+    }
+
     pub fn put_image(&self, i: &ImageRecord) -> Result<()> {
         self.conn.execute(
             "INSERT OR REPLACE INTO images (name, digest, path, source, built_at, size_bytes) \
@@ -556,6 +637,9 @@ mod tests {
                 net_profile: "dev".into(),
                 created_at: 1,
                 last_active_at: 1,
+                started_from: None,
+                template: None,
+                net_mode: None,
             },
             vsock_cid: cid,
             vm_json: None,
@@ -648,6 +732,30 @@ mod tests {
             ]
         );
         assert_eq!(last[0].verdict, Verdict::Denied);
+    }
+
+    #[test]
+    fn templates_round_trip() {
+        let s = Store::open_in_memory().unwrap();
+        let t = TemplateRecord {
+            key: "k1".into(),
+            kind: "base".into(),
+            family: "base:test:2:1024:1".into(),
+            name: None,
+            image_digest: "sha256:aa".into(),
+            built_at: 5,
+            host_fingerprint: "{}".into(),
+            size_bytes: 10,
+            last_used_at: 5,
+            meta_json: "{}".into(),
+        };
+        s.put_template(&t).unwrap();
+        s.touch_template("k1", 9).unwrap();
+        let all = s.templates().unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].last_used_at, 9);
+        s.delete_template("k1").unwrap();
+        assert!(s.templates().unwrap().is_empty());
     }
 
     #[test]

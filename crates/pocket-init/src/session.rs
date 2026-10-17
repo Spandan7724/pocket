@@ -27,6 +27,9 @@ struct State {
     clients: Vec<(u64, SyncSender<AttachOut>)>,
     size: PtySize,
     exited: Option<ExitStatus>,
+    last_output_unix_ms: u64,
+    last_bell_unix_ms: u64,
+    tail: crate::notify::Tail,
 }
 
 pub struct Session {
@@ -53,6 +56,9 @@ impl Session {
             size: st.size,
             attached: st.clients.len() as u32,
             exited: st.exited,
+            last_output_unix_ms: st.last_output_unix_ms,
+            last_bell_unix_ms: st.last_bell_unix_ms,
+            tail: st.tail.text(),
         }
     }
 }
@@ -101,6 +107,9 @@ pub fn create(
             clients: Vec::new(),
             size,
             exited: None,
+            last_output_unix_ms: 0,
+            last_bell_unix_ms: 0,
+            tail: Default::default(),
         }),
     });
     map.insert(name.into(), s.clone());
@@ -122,7 +131,11 @@ fn pump(s: Arc<Session>, status: Receiver<ExitStatus>) {
             Err(_) => break, // EIO: no slave left open
         };
         let data = &buf[..n];
-        for f in scan.feed(data) {
+        let found = scan.feed(data);
+        if !found.is_empty() {
+            s.state().last_bell_unix_ms = sys::unix_ms();
+        }
+        for f in found {
             control::broadcast(match f {
                 crate::notify::Found::Bell => GuestEvent::SessionBell {
                     name: s.name.clone(),
@@ -135,6 +148,8 @@ fn pump(s: Arc<Session>, status: Receiver<ExitStatus>) {
             });
         }
         let mut st = s.state();
+        st.last_output_unix_ms = sys::unix_ms();
+        st.tail.feed(data);
         st.scrollback.extend(data);
         let excess = st.scrollback.len().saturating_sub(SCROLLBACK);
         st.scrollback.drain(..excess);
@@ -157,6 +172,13 @@ fn pump(s: Arc<Session>, status: Receiver<ExitStatus>) {
     };
     for (_, tx) in clients {
         let _ = tx.send(AttachOut::Exited(st));
+    }
+    let current = sessions()
+        .as_ref()
+        .and_then(|m| m.get(&s.name))
+        .is_some_and(|c| Arc::ptr_eq(c, &s));
+    if !current {
+        return;
     }
     control::broadcast(GuestEvent::SessionExited {
         name: s.name.clone(),
@@ -195,6 +217,16 @@ pub fn kill(name: &str, signal: i32) -> Result<(), GuestError> {
         Err(e) if e.raw_os_error() == Some(libc::ESRCH) => Ok(()),
         r => r.map_err(|e| GuestError::new(ErrorKind::Io, format!("kill: {e}"))),
     }
+}
+
+/// Restore hook of a clone: every process but PID 1 belongs to the VM it was cloned
+/// from (stale randomness, identity and environment), so all of them go.
+pub fn forget_all() {
+    sessions().take();
+    TOKENS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    crate::exec::forget_all();
+    // kill(-1) from PID 1 signals every process except PID 1 itself.
+    let _ = sys::kill(-1, libc::SIGKILL);
 }
 
 struct Token {
