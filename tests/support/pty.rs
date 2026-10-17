@@ -53,10 +53,12 @@ impl Pty {
     pub fn spawn(mut cmd: Command, rows: u16, cols: u16) -> Pty {
         let (master, slave) = openpty(rows, cols);
         let sfd = slave.as_raw_fd();
+        if !cmd.get_envs().any(|(k, v)| k == "TERM" && v.is_some()) {
+            cmd.env("TERM", "xterm-256color");
+        }
         cmd.stdin(Stdio::from(slave.try_clone().unwrap()))
             .stdout(Stdio::from(slave.try_clone().unwrap()))
-            .stderr(Stdio::from(slave.try_clone().unwrap()))
-            .env("TERM", "xterm-256color");
+            .stderr(Stdio::from(slave.try_clone().unwrap()));
         // SAFETY: setsid + TIOCSCTTY are async-signal-safe.
         unsafe {
             cmd.pre_exec(move || {

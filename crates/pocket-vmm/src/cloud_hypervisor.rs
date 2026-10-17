@@ -36,6 +36,8 @@ pub struct LaunchSpec {
     pub balloon: bool,
     /// virtio-fs devices `(tag, vhost-user socket)`; guest memory is then shared.
     pub fs: Vec<(String, PathBuf)>,
+    /// vhost-user virtio-net backend socket; guest memory is then shared.
+    pub net_vhost: Option<PathBuf>,
 }
 
 impl LaunchSpec {
@@ -54,11 +56,17 @@ impl LaunchSpec {
             .arg("--cpus")
             .arg(format!("boot={}", self.vcpus))
             .arg("--memory")
-            .arg(if self.fs.is_empty() {
+            .arg(if self.fs.is_empty() && self.net_vhost.is_none() {
                 format!("size={}M", self.memory_mib)
             } else {
                 format!("size={}M,shared=on", self.memory_mib)
             });
+        if let Some(sock) = &self.net_vhost {
+            c.arg("--net").arg(format!(
+                "vhost_user=true,socket={},vhost_mode=client",
+                sock.display()
+            ));
+        }
         for (tag, sock) in &self.fs {
             c.arg("--fs")
                 .arg(format!("tag={tag},socket={}", sock.display()));
@@ -159,6 +167,7 @@ impl CloudHypervisor {
             serial_log: spec.serial_log.clone(),
             balloon: true,
             fs: spec.shared_fs.clone(),
+            net_vhost: spec.net_vhost.clone(),
         }
     }
 
@@ -336,11 +345,12 @@ impl VmmBackend for CloudHypervisor {
             }
             let dir = spec.runtime_dir.join("restore");
             prepare_restore_dir(&snap.dir, &dir, &ls)?;
-            let mode = if self.capabilities().lazy_restore && ls.fs.is_empty() {
-                "copyonwrite"
-            } else {
-                "copy"
-            };
+            let mode =
+                if self.capabilities().lazy_restore && ls.fs.is_empty() && ls.net_vhost.is_none() {
+                    "copyonwrite"
+                } else {
+                    "copy"
+                };
             let mut inner = Command::new(&self.binary);
             inner
                 .arg("--api-socket")
@@ -644,6 +654,7 @@ mod tests {
             serial_log: None,
             balloon: true,
             fs: vec![],
+            net_vhost: None,
         };
         let args: Vec<String> = spec
             .command()

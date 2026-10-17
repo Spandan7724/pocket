@@ -174,7 +174,20 @@ pub fn listen(
                 let _busy = busy;
                 match first_frame::<ProxyOpen>(&mut s).await {
                     Some(ProxyOpen::HttpProxy) => pocket_net::proxy::serve(s, ctx).await,
-                    other => tracing::warn!("{}: rejected proxy stream {other:?}", ctx.pocket),
+                    // Transparent mode: policed exactly like CONNECT (the guest is hostile
+                    // either way; a guest in proxy mode gains nothing by sending these).
+                    Some(ProxyOpen::Direct { host, port, .. }) => {
+                        pocket_net::proxy::serve_direct(s, ctx, &host, port).await
+                    }
+                    Some(ProxyOpen::Dns { name }) => {
+                        let r = pocket_net::proxy::dns_check(&ctx, &name).await;
+                        let reply = pocket_proto::guest::DnsReply(r);
+                        if let Ok(frame) = pocket_proto::frame::encode(&reply) {
+                            use tokio::io::AsyncWriteExt;
+                            let _ = s.write_all(&frame).await;
+                        }
+                    }
+                    None => tracing::warn!("{}: rejected proxy stream", ctx.pocket),
                 }
             });
         }

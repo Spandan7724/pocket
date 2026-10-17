@@ -38,9 +38,14 @@ pub fn start(port: u16) -> io::Result<()> {
 }
 
 fn forward(tcp: TcpStream) -> io::Result<()> {
+    forward_with(tcp, ProxyOpen::HttpProxy)
+}
+
+/// One TCP connection to the host proxy port, opened with `open`.
+pub fn forward_with(tcp: TcpStream, open: ProxyOpen) -> io::Result<()> {
     tcp.set_nodelay(true)?;
     let host = sys::vsock_connect(libc::VMADDR_CID_HOST, PROXY_PORT)?;
-    send(&mut &host, &ProxyOpen::HttpProxy).map_err(io::Error::other)?;
+    send(&mut &host, &open).map_err(io::Error::other)?;
     let (tcp2, host2) = (tcp.try_clone()?, host.try_clone()?);
     let up = std::thread::spawn(move || {
         copy(&tcp2, &host2);

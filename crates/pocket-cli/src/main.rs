@@ -11,6 +11,7 @@ mod exec;
 mod notice;
 mod project;
 mod secrets;
+mod ssh;
 mod term;
 mod vsock;
 
@@ -65,9 +66,16 @@ enum Cmd {
         /// Disk quota (sparse), e.g. 20G.
         #[arg(long)]
         disk: Option<String>,
-        /// Network profile: dev, strict, offline.
+        /// Network profile: dev, strict, offline, or full (a real NIC via passt: NOT filtered).
         #[arg(long)]
         net: Option<String>,
+        /// Route all guest TCP and DNS through the proxy, also for tools that ignore proxy
+        /// settings (TUN + redirect in the guest; same policy and logging).
+        #[arg(long, conflicts_with = "net")]
+        transparent: bool,
+        /// Start from a template made with `pocket save P --as NAME`.
+        #[arg(long)]
+        template: Option<String>,
         /// Extra allowed destinations (host, *.domain, CIDR, optional :port).
         #[arg(long)]
         allow: Vec<String>,
@@ -155,6 +163,32 @@ enum Cmd {
     Hibernate { pocket: String },
     /// List snapshot templates and the warm pool.
     Templates,
+    /// Copy files between the host and a pocket: `pocket cp ./x P:/work/x`, `pocket cp P:out .`
+    Cp { src: String, dst: String },
+    /// Snapshot a configured pocket (memory, disk, setup) as a reusable template.
+    Save {
+        pocket: String,
+        #[arg(long = "as")]
+        name: String,
+    },
+    /// OpenSSH ProxyCommand: connects stdin/stdout to the pocket's sshd over vsock.
+    SshProxy { pocket: String },
+    /// SSH into a pocket (OpenSSH over vsock); `-- CMD` runs a command.
+    Ssh {
+        pocket: String,
+        #[arg(last = true)]
+        command: Vec<String>,
+    },
+    /// Open the pocket in VS Code / Cursor / Zed over SSH.
+    Code {
+        pocket: String,
+        /// code, cursor or zed (default: the first one installed).
+        #[arg(long)]
+        editor: Option<String>,
+        /// Print the editor command instead of running it.
+        #[arg(long)]
+        print: bool,
+    },
     /// Measure start paths, density and attach latency (JSON with --json).
     Bench {
         #[arg(long, default_value_t = 20)]
@@ -477,6 +511,9 @@ fn default_new(name: Option<String>, preset: Option<String>, repo: Option<PathBu
         idle_hibernate_ms: None,
         net_mode: None,
         template: None,
+        terminfo: std::env::var("TERM")
+            .ok()
+            .and_then(|t| pocket_proto::rpc::find_terminfo(&t)),
     }
 }
 
@@ -512,6 +549,15 @@ fn print_pockets(list: &[PocketInfo]) {
         );
         if let pocket_proto::rpc::PocketState::Broken { reason } = &p.state {
             println!("    ⚠ {reason}");
+        }
+        match p.net_mode.as_deref() {
+            Some("full") => println!(
+                "    ⚠ full network access (--net full): traffic outside the proxy is NOT filtered or logged"
+            ),
+            Some("transparent") => {
+                println!("    · transparent networking: all TCP and DNS go through the proxy")
+            }
+            _ => {}
         }
     }
 }
@@ -758,6 +804,8 @@ fn command(c: &mut Client, cmd: Cmd, j: bool) -> Result<u8> {
             no_auto_forward,
             share_dirs,
             command,
+            transparent,
+            template,
         } => {
             let mut share = vec![];
             for d in share_dirs {
@@ -829,7 +877,7 @@ fn command(c: &mut Client, cmd: Cmd, j: bool) -> Result<u8> {
                     .transpose()?
                     .map(|m| m as u32),
                 disk_mib: disk.as_deref().map(parse_size_mib).transpose()?,
-                net_profile: net,
+                net_profile: net.clone(),
                 allow,
                 deny: vec![],
                 command: (!command.is_empty()).then_some(command),
@@ -851,9 +899,25 @@ fn command(c: &mut Client, cmd: Cmd, j: bool) -> Result<u8> {
                 share,
                 idle_pause_ms: None,
                 idle_hibernate_ms: None,
-                net_mode: None,
-                template: None,
+                net_mode: if transparent {
+                    Some("transparent".into())
+                } else if net.as_deref() == Some("full") {
+                    Some("full".into())
+                } else {
+                    None
+                },
+                template,
+                terminfo: std::env::var("TERM")
+                    .ok()
+                    .and_then(|t| pocket_proto::rpc::find_terminfo(&t)),
             };
+            if req.net_mode.as_deref() == Some("full") && !j {
+                eprintln!(
+                    "⚠ --net full gives the pocket a real network interface: connections that \
+                     ignore the proxy settings are NOT filtered or logged, and it can reach your \
+                     LAN. Only the host's loopback stays out of reach."
+                );
+            }
             let mut req = req;
             if let Some(repo) = req.repo.clone()
                 && let Some((path, p)) = project::load(&repo)?
@@ -920,6 +984,9 @@ fn command(c: &mut Client, cmd: Cmd, j: bool) -> Result<u8> {
                 rows,
                 cols,
                 term: std::env::var("TERM").ok(),
+                terminfo: std::env::var("TERM")
+                    .ok()
+                    .and_then(|t| pocket_proto::rpc::find_terminfo(&t)),
             })?
             else {
                 return Err(CliError::new("internal", 70, "unexpected reply"));
@@ -1019,6 +1086,9 @@ fn command(c: &mut Client, cmd: Cmd, j: bool) -> Result<u8> {
                 rows,
                 cols,
                 term: std::env::var("TERM").ok(),
+                terminfo: std::env::var("TERM")
+                    .ok()
+                    .and_then(|t| pocket_proto::rpc::find_terminfo(&t)),
             })?
             else {
                 return Err(CliError::new("internal", 70, "unexpected reply"));
@@ -1128,6 +1198,83 @@ fn command(c: &mut Client, cmd: Cmd, j: bool) -> Result<u8> {
                 eprintln!("✓ no regression > 10% against {}", b.display());
             }
             Ok(0)
+        }
+        Cmd::Cp { src, dst } => {
+            let split = |s: &str| -> Option<(String, String)> {
+                // `P:path`; a host path with a colon must be written as ./a:b.
+                let (p, path) = s.split_once(':')?;
+                (!p.is_empty() && !p.contains('/') && !s.starts_with('.'))
+                    .then(|| (p.into(), path.into()))
+            };
+            let req = match (split(&src), split(&dst)) {
+                (Some((p, path)), None) => Request::CopyOut {
+                    pocket: resolve_pocket(c, &p)?,
+                    src: path,
+                    dst: std::path::absolute(&dst).map_err(|e| CliError::io(&dst, e))?,
+                },
+                (None, Some((p, path))) => Request::CopyIn {
+                    pocket: resolve_pocket(c, &p)?,
+                    src: std::path::absolute(&src).map_err(|e| CliError::io(&src, e))?,
+                    dst: path,
+                },
+                _ => {
+                    return Err(
+                        CliError::usage("one side of `pocket cp` names a pocket: P:PATH").hint(
+                            "pocket cp ./file mypocket:/work/  or  pocket cp mypocket:/work/out .",
+                        ),
+                    );
+                }
+            };
+            let Response::Text { text, .. } = c.request(req)? else {
+                return Err(CliError::new("internal", 70, "unexpected reply"));
+            };
+            if j {
+                json(&serde_json::json!({ "result": text }));
+            } else {
+                println!("{text}");
+            }
+            Ok(0)
+        }
+        Cmd::Save { pocket, name } => {
+            let p = resolve_pocket(c, &pocket)?;
+            let Response::Templates(t) = c.request_with(
+                Request::Save {
+                    pocket: p,
+                    name: name.clone(),
+                },
+                progress_printer(j),
+            )?
+            else {
+                return Err(CliError::new("internal", 70, "unexpected reply"));
+            };
+            end_progress();
+            if j {
+                json(&t);
+            } else {
+                println!(
+                    "saved template {name} ({}); start pockets from it with `pocket new --template {name}`",
+                    t.first()
+                        .map(|t| human_bytes(t.size_bytes))
+                        .unwrap_or_default()
+                );
+            }
+            Ok(0)
+        }
+        Cmd::SshProxy { pocket } => {
+            let p = resolve_pocket(c, &pocket)?;
+            ssh::proxy(c, &p)
+        }
+        Cmd::Ssh { pocket, command } => {
+            let p = resolve_pocket(c, &pocket)?;
+            ssh::ssh(c, &p, &command)
+        }
+        Cmd::Code {
+            pocket,
+            editor,
+            print,
+        } => {
+            let p = resolve_pocket(c, &pocket)?;
+            ssh::code(c, &p, editor.as_deref(), print)
         }
         Cmd::Templates => {
             let Response::Templates(list) = c.request(Request::Templates)? else {

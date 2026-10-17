@@ -122,6 +122,8 @@ pub struct VmSpec {
     pub serial_log: Option<PathBuf>,
     /// virtio-fs shares `(tag, vhost-user socket)`, served by a virtiofsd the caller runs.
     pub shared_fs: Vec<(String, PathBuf)>,
+    /// A virtio-net NIC through this vhost-user socket (passt, `--net full`); none by default.
+    pub net_vhost: Option<PathBuf>,
 }
 
 /// Everything needed to find a running VM again, also after a daemon restart.

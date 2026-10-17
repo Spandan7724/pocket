@@ -15,7 +15,7 @@ use crate::frame::Validate;
 use crate::{ProtoError, invalid};
 
 /// Bump on every change to the types in this module.
-pub const PROTO_VERSION: u32 = 5;
+pub const PROTO_VERSION: u32 = 6;
 
 pub const CONTROL_PORT: u32 = 1024;
 pub const STREAM_PORT: u32 = 1025;
@@ -87,6 +87,7 @@ pub enum HostReq {
         env: Vec<(String, String)>,
         proxy_port: u16,
         machine_id: String,
+        net_mode: NetMode,
     },
     /// The request id doubles as the exec id for [`StreamOpen::ExecIo`]. `user` is a
     /// guest account name (`None` = root).
@@ -314,6 +315,25 @@ pub enum StreamOpen {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StreamAck(pub Result<(), GuestError>);
 
+/// How guest traffic leaves (ARCHITECTURE.md §6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum NetMode {
+    /// Proxy environment variables only.
+    #[default]
+    Proxy,
+    /// Also a TUN default route: every TCP connection and DNS query is redirected to
+    /// pocket-init and leaves as a `ProxyOpen::Direct` / `Dns` stream.
+    Transparent,
+    /// A real NIC (passt); traffic outside the proxy variables is not policed.
+    Full,
+}
+
+/// Host → guest answer on a `ProxyOpen::Dns` stream.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DnsReply(pub Result<(), String>);
+
+pub const MAX_REASON: usize = 512;
+
 /// First frame of a guest → host [`PROXY_PORT`] stream.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProxyOpen {
@@ -326,6 +346,9 @@ pub enum ProxyOpen {
         port: u16,
         sni: Option<String>,
     },
+    /// Transparent mode: may the guest resolve `name`? The host checks the policy, logs,
+    /// resolves, and answers one [`DnsReply`]; the guest hands out a local address.
+    Dns { name: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -675,6 +698,16 @@ impl Validate for ProxyOpen {
                 sni.as_deref()
                     .map_or(Ok(()), |s| check(valid_hostname(s), "invalid SNI"))
             }
+            ProxyOpen::Dns { name } => check(valid_hostname(name), "invalid DNS name"),
+        }
+    }
+}
+
+impl Validate for DnsReply {
+    fn validate(&self) -> Result<(), ProtoError> {
+        match &self.0 {
+            Ok(()) => Ok(()),
+            Err(r) => check(r.len() <= MAX_REASON, "reason too long"),
         }
     }
 }
@@ -778,6 +811,7 @@ mod tests {
                 env: env.clone(),
                 proxy_port: 3128,
                 machine_id: "0123456789abcdef0123456789abcdef".into(),
+                net_mode: NetMode::Transparent,
             },
             HostReq::Exec {
                 argv: vec!["sh".into(), "-c".into(), "true".into()],

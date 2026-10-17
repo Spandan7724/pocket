@@ -5,6 +5,7 @@ mod boot;
 mod control;
 mod exec;
 mod guestsock;
+mod netmode;
 mod netshim;
 mod notify;
 mod ports;

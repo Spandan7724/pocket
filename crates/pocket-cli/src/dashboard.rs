@@ -511,6 +511,9 @@ fn handle(st: &mut State, c: Cmd, kick: &Sender<()>) {
                             rows: 24,
                             cols: 80,
                             term: std::env::var("TERM").ok(),
+                            terminfo: std::env::var("TERM")
+                                .ok()
+                                .and_then(|t| pocket_proto::rpc::find_terminfo(&t)),
                         },
                         "opened a shell in",
                     ),

@@ -87,6 +87,7 @@ fn inner() -> Result {
     cross_aarch64()?;
     kernel::build(false)?;
     assets::vmm()?;
+    assets::passt()?;
     assets::system()?;
     assets::test_base()?;
     presets()?;

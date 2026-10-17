@@ -332,7 +332,7 @@ where
         }
     };
     let o = if head.method == "CONNECT" {
-        connect(&mut guest, head, &ctx).await
+        connect(&mut guest, head, &ctx, "connect").await
     } else {
         // Logs each request itself.
         plain(&mut guest, head, &ctx).await
@@ -342,7 +342,7 @@ where
     }
 }
 
-async fn connect<S>(guest: &mut S, head: Head, ctx: &ProxyCtx) -> Option<Outcome>
+async fn connect<S>(guest: &mut S, head: Head, ctx: &ProxyCtx, kind: &str) -> Option<Outcome>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -356,7 +356,7 @@ where
         .await;
         return None;
     };
-    let mut o = Outcome::new(&ctx.pocket, "connect", &host, port);
+    let mut o = Outcome::new(&ctx.pocket, kind, &host, port);
     o.entry.method = Some("CONNECT".into());
     let decision = ctx.policy.read().unwrap().decide(&host, port);
     if let Err(why) = decision {
@@ -433,6 +433,145 @@ where
     o.entry.bytes_up = a + first.len() as u64;
     o.entry.bytes_down = b;
     Some(o)
+}
+
+/// Transparent mode: a TCP stream the guest redirected to `host:port` (a name its DNS shim
+/// handed out an address for, or an IP literal). It takes exactly the CONNECT path —
+/// policy, resolution and always-denied ranges, SNI check, interception, logging — with
+/// the proxy's HTTP replies swallowed, since the client never spoke to a proxy.
+pub async fn serve_direct<S>(guest: S, ctx: Arc<ProxyCtx>, host: &str, port: u16)
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let host = normalize_host(host);
+    let target = match host.parse::<IpAddr>() {
+        Ok(IpAddr::V6(_)) => format!("[{host}]:{port}"),
+        _ => format!("{host}:{port}"),
+    };
+    let head = Head {
+        method: "CONNECT".into(),
+        target,
+        version: "HTTP/1.1".into(),
+        headers: vec![],
+        rest: vec![],
+    };
+    let mut g = Quiet::new(guest);
+    if let Some(o) = connect(&mut g, head, &ctx, "direct").await {
+        (ctx.log)(o.entry);
+    }
+}
+
+/// Transparent-mode DNS: the name must be allowed, resolve, and not only to always-denied
+/// addresses. Every query is logged.
+pub async fn dns_check(ctx: &ProxyCtx, name: &str) -> Result<(), String> {
+    let name = normalize_host(name);
+    let mut o = Outcome::new(&ctx.pocket, "dns", &name, 53);
+    o.entry.method = Some("A".into());
+    let r = async {
+        let decision = ctx.policy.read().unwrap().decide_name(&name);
+        if let Err(why) = decision {
+            ctx.blocked(&name, 443, &why);
+            return Err(why);
+        }
+        let addrs = tokio::time::timeout(CONNECT_TIMEOUT, ctx.resolver.resolve(&name))
+            .await
+            .map_err(|_| format!("resolving {name} timed out"))?
+            .map_err(|e| format!("cannot resolve {name}: {e}"))?;
+        o.entry.ip = addrs.first().map(|a| a.to_string());
+        if !addrs.is_empty() && addrs.iter().all(|a| forbidden_ip(*a).is_some()) {
+            return Err(format!("{name} resolves only to always-denied addresses"));
+        }
+        if addrs.is_empty() {
+            return Err(format!("{name} has no addresses"));
+        }
+        Ok(())
+    }
+    .await;
+    match &r {
+        Ok(()) => {
+            o.entry.verdict = Verdict::Allowed;
+            o.entry.reason = "allowed".into();
+        }
+        Err(why) => o.entry.reason = why.clone(),
+    }
+    (ctx.log)(o.entry);
+    r
+}
+
+/// Writes through to the guest except the proxy's HTTP reply head; a non-200 reply (a
+/// refusal) closes the stream without sending anything.
+struct Quiet<S> {
+    inner: S,
+    head: Vec<u8>,
+    state: u8, // 0 = in reply head, 1 = passing through, 2 = refused
+}
+
+impl<S> Quiet<S> {
+    fn new(inner: S) -> Quiet<S> {
+        Quiet {
+            inner,
+            head: vec![],
+            state: 0,
+        }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for Quiet<S> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        if self.state == 2 {
+            return std::task::Poll::Ready(Ok(()));
+        }
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for Quiet<S> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        use std::task::Poll;
+        match self.state {
+            1 => std::pin::Pin::new(&mut self.inner).poll_write(cx, buf),
+            2 => Poll::Ready(Ok(buf.len())),
+            _ => {
+                let before = self.head.len();
+                self.head.extend_from_slice(buf);
+                let Some(end) = self.head.windows(4).position(|w| w == b"\r\n\r\n") else {
+                    if self.head.len() > 8192 {
+                        self.state = 2;
+                    }
+                    return Poll::Ready(Ok(buf.len()));
+                };
+                self.state = if self.head.starts_with(b"HTTP/1.1 200") {
+                    1
+                } else {
+                    2
+                };
+                // Report only the head bytes as written; the caller resends the rest.
+                let used = (end + 4).saturating_sub(before).min(buf.len());
+                self.head.clear();
+                Poll::Ready(Ok(used.max(1).min(buf.len())))
+            }
+        }
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
 }
 
 pub(crate) const HOP_BY_HOP: &[&str] = &[
@@ -908,6 +1047,52 @@ where
     }
     let _ = guest.flush().await;
     (Some(o), !(client_close || until_close))
+}
+
+#[cfg(test)]
+mod quiet_tests {
+    use super::Quiet;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn swallows_the_reply_head_and_refusals() {
+        let (a, mut b) = tokio::io::duplex(4096);
+        let mut q = Quiet::new(a);
+        q.write_all(b"HTTP/1.1 200 Connection established\r\n\r\nTLS-bytes")
+            .await
+            .unwrap();
+        q.write_all(b" more").await.unwrap();
+        drop(q);
+        let mut got = vec![];
+        b.read_to_end(&mut got).await.unwrap();
+        assert_eq!(got, b"TLS-bytes more");
+
+        let (a, mut b) = tokio::io::duplex(4096);
+        let mut q = Quiet::new(a);
+        q.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 9\r\n\r\nblocked!\n")
+            .await
+            .unwrap();
+        drop(q);
+        let mut got = vec![];
+        b.read_to_end(&mut got).await.unwrap();
+        assert!(got.is_empty(), "{got:?}");
+    }
+
+    #[test]
+    fn names_for_dns() {
+        let mut p = crate::policy::Policy::profile("strict").unwrap();
+        assert!(p.decide_name("api.anthropic.com").is_ok());
+        assert!(p.decide_name("evil.example").is_err());
+        p.allow
+            .push(crate::policy::Rule::parse("db.internal.test:5432").unwrap());
+        assert!(
+            p.decide_name("db.internal.test").is_ok(),
+            "any port counts for DNS"
+        );
+        p.deny
+            .push(crate::policy::Rule::parse("api.anthropic.com").unwrap());
+        assert!(p.decide_name("api.anthropic.com").is_err());
+    }
 }
 
 #[cfg(test)]

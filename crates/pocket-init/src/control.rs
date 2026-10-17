@@ -147,6 +147,7 @@ fn handle(id: u64, req: HostReq) -> Result<Reply, GuestError> {
             env,
             proxy_port,
             machine_id,
+            net_mode,
         } => {
             sealed()?;
             set_identity(&hostname, &machine_id)?;
@@ -158,6 +159,15 @@ fn handle(id: u64, req: HostReq) -> Result<Reply, GuestError> {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()) = env;
             netshim::start(proxy_port).map_err(io_err("proxy shim"))?;
+            match net_mode {
+                pocket_proto::guest::NetMode::Proxy => {}
+                pocket_proto::guest::NetMode::Transparent => {
+                    crate::netmode::start_transparent().map_err(io_err("transparent networking"))?
+                }
+                pocket_proto::guest::NetMode::Full => {
+                    crate::netmode::start_full().map_err(io_err("network interface"))?
+                }
+            }
             crate::ports::start_watcher(vec![proxy_port]);
             crate::guestsock::start();
             if process::GLOBAL_ENV
@@ -242,6 +252,12 @@ fn handle(id: u64, req: HostReq) -> Result<Reply, GuestError> {
             let t2 = sys::boottime_ns();
             if clone {
                 session::forget_all();
+                // The source VM's SSH host keys must not be shared by its clones.
+                for e in fs::read_dir("/etc/ssh").into_iter().flatten().flatten() {
+                    if e.file_name().to_string_lossy().starts_with("ssh_host_") {
+                        let _ = fs::remove_file(e.path());
+                    }
+                }
             }
             let t3 = sys::boottime_ns();
             set_identity(&hostname, &machine_id)?;

@@ -14,6 +14,10 @@ const INIT_MAX_BYTES: u64 = 5 * 1024 * 1024;
 // D3: copyonwrite restore is on main but not in v53.0; re-pin to v54.0 once released.
 const CH_REPO: &str = "https://github.com/cloud-hypervisor/cloud-hypervisor.git";
 const CH_COMMIT: &str = "1c7088c0bc4d2a41b9b5d308ed9e8fdf6524f695";
+/// passt for `--net full` (D28): vhost-user support needs a 2024-11 or newer release, which
+/// distributions such as Ubuntu 24.04 do not ship.
+const PASST_REPO: &str = "https://passt.top/passt";
+const PASST_TAG: &str = "2026_10_02.cba3570";
 
 const ALPINE_URL: &str = "https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/x86_64/alpine-minirootfs-3.24.2-x86_64.tar.gz";
 const ALPINE_SHA256: &str = "c5ca053cfe1d85c5b96dff8b9bc57045f7f184a30ffb6b65776409ca90388677";
@@ -184,6 +188,46 @@ pub fn vmm() -> Result<PathBuf> {
     fs::copy(src.join("target/release/cloud-hypervisor"), &dest)?;
     fs::write(&stamp, CH_COMMIT)?;
     eprintln!("{}", output(Command::new(&dest).arg("--version"))?.trim());
+    Ok(dest)
+}
+
+pub fn passt() -> Result<PathBuf> {
+    step(&format!("passt {PASST_TAG}"));
+    let dest = out().join("bin").join("passt");
+    let stamp = dest.with_extension("tag");
+    if dest.exists() && fs::read_to_string(&stamp).is_ok_and(|s| s.trim() == PASST_TAG) {
+        eprintln!("up to date: {}", dest.display());
+        return Ok(dest);
+    }
+    let src = out().join("src").join(format!("passt-{PASST_TAG}"));
+    if !src.join("Makefile").exists() {
+        fresh_dir(&src)?;
+        let git = |args: &[&str]| run(Command::new("git").current_dir(&src).args(args));
+        git(&["init", "-q"])?;
+        git(&[
+            "fetch",
+            "-q",
+            "--depth",
+            "1",
+            PASST_REPO,
+            &format!("refs/tags/{PASST_TAG}"),
+        ])?;
+        git(&["checkout", "-q", "FETCH_HEAD"])?;
+    }
+    run(Command::new("make")
+        .current_dir(&src)
+        .args(["-j8", "passt"])
+        .env("VERSION", PASST_TAG))?;
+    fs::create_dir_all(dest.parent().unwrap())?;
+    fs::copy(src.join("passt"), &dest)?;
+    fs::write(&stamp, PASST_TAG)?;
+    eprintln!(
+        "{}",
+        output(Command::new(&dest).arg("--version"))?
+            .lines()
+            .next()
+            .unwrap_or("")
+    );
     Ok(dest)
 }
 

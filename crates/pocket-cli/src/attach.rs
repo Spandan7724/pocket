@@ -738,6 +738,9 @@ pub fn attach(client: &mut Client, pocket: &str, mut session: Option<String>) ->
                     rows,
                     cols,
                     term: std::env::var("TERM").ok(),
+                    terminfo: std::env::var("TERM")
+                        .ok()
+                        .and_then(|t| pocket_proto::rpc::find_terminfo(&t)),
                 })?
                 else {
                     return Err(CliError::new(

@@ -110,6 +110,9 @@ pub struct NewPocket {
     /// Saved template (`pocket save --as NAME`) to start from.
     #[serde(default)]
     pub template: Option<String>,
+    /// The client's compiled terminfo entry for `term`, installed when the image lacks one.
+    #[serde(default)]
+    pub terminfo: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -232,6 +235,8 @@ pub enum Request {
         rows: u16,
         cols: u16,
         term: Option<String>,
+        #[serde(default)]
+        terminfo: Option<Vec<u8>>,
     },
     SessionList {
         pocket: String,
@@ -353,6 +358,29 @@ pub enum Request {
         pocket: String,
     },
     Pool,
+    /// `pocket cp HOST POCKET:PATH`.
+    CopyIn {
+        pocket: String,
+        src: PathBuf,
+        dst: String,
+    },
+    /// `pocket cp POCKET:PATH HOST` (unpacked with path and type checks on the host).
+    CopyOut {
+        pocket: String,
+        src: String,
+        dst: PathBuf,
+    },
+    /// `pocket save P --as NAME`: snapshot a configured pocket as a named template.
+    Save {
+        pocket: String,
+        name: String,
+    },
+    /// Starts the pocket's sshd (vsock only) with pocket's key authorized; returns how to
+    /// reach it (`pocket ssh-proxy`).
+    SshPrepare {
+        pocket: String,
+        public_key: String,
+    },
     /// Start-path measurements (PERFORMANCE.md §4); the reply is a JSON report.
     Bench {
         runs: u32,
@@ -401,7 +429,62 @@ pub enum Response {
     Pool(PoolInfo),
     /// A JSON document (bench report).
     Json(String),
+    Ssh {
+        vsock_uds: PathBuf,
+        user: String,
+        /// The guest's host key line (`ssh-ed25519 AAAA…`), pinned in known_hosts.
+        host_key: String,
+    },
 }
+
+pub fn valid_term(t: &str) -> bool {
+    !t.is_empty()
+        && t.len() <= 64
+        && t.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._+-".contains(&b))
+}
+
+/// This process's compiled terminfo entry for `term` (`$TERMINFO`, `~/.terminfo`,
+/// `$TERMINFO_DIRS`, system dirs; `x/name` and `78/name` layouts). Terminals like Ghostty
+/// point `TERMINFO` at their own entries, so the client sends it along.
+pub fn find_terminfo(term: &str) -> Option<Vec<u8>> {
+    use std::path::PathBuf;
+    if !valid_term(term) {
+        return None;
+    }
+    let first = term.chars().next()?;
+    let mut dirs: Vec<PathBuf> = vec![];
+    if let Some(t) = std::env::var_os("TERMINFO") {
+        dirs.push(t.into());
+    }
+    if let Some(h) = std::env::var_os("HOME") {
+        dirs.push(PathBuf::from(h).join(".terminfo"));
+    }
+    if let Some(d) = std::env::var_os("TERMINFO_DIRS") {
+        dirs.extend(std::env::split_paths(&d));
+    }
+    dirs.extend(
+        [
+            "/etc/terminfo",
+            "/lib/terminfo",
+            "/usr/share/terminfo",
+            "/usr/lib/terminfo",
+        ]
+        .map(PathBuf::from),
+    );
+    for d in dirs {
+        for sub in [first.to_string(), format!("{:02x}", first as u32)] {
+            if let Ok(data) = std::fs::read(d.join(&sub).join(term))
+                && data.len() <= MAX_TERMINFO
+            {
+                return Some(data);
+            }
+        }
+    }
+    None
+}
+
+pub const MAX_TERMINFO: usize = 64 * 1024;
 
 /// Derived session state (CONTRACTS.md §4), from what the guest reports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -878,6 +961,7 @@ mod tests {
                     idle_hibernate_ms: None,
                     net_mode: None,
                     template: None,
+                    terminfo: None,
                 }),
             },
             ClientMsg::Subscribe {

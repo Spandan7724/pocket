@@ -112,6 +112,7 @@ fn boots_as_pid1_with_overlay_root_and_reports_ready() {
         env: vec![("POCKET_TEST".into(), "yes".into())],
         proxy_port: 3128,
         machine_id: "00112233445566778899aabbccddeeff".into(),
+        net_mode: pocket_proto::guest::NetMode::Proxy,
     });
     assert_eq!(r, Ok(Reply::Done));
     assert_eq!(sh(&mut ctl, u, "hostname").trim(), "configured");

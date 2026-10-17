@@ -328,6 +328,7 @@ async fn build(
             log_path: staging.join("vmm.log"),
             serial_log: None,
             shared_fs: vec![],
+            net_vhost: None,
         };
         let vm = d
             .backend
@@ -642,4 +643,103 @@ pub async fn snapshot_pocket(
         size >> 20
     );
     Ok(())
+}
+
+/// `pocket save P --as NAME`.
+pub async fn save(d: &Arc<Daemon>, pocket: &str, name: &str) -> R<pocket_proto::rpc::TemplateInfo> {
+    if !crate::daemon::valid_pocket_name(name) {
+        return Err(err(
+            ErrorCode::BadRequest,
+            format!("invalid template name {name:?}"),
+        )
+        .hint("use 1–40 lowercase letters, digits and dashes"));
+    }
+    if !templates_enabled() {
+        return Err(err(
+            ErrorCode::BadRequest,
+            "templates are disabled (POCKET_TEMPLATES=off)",
+        ));
+    }
+    let rec = d.find(pocket)?;
+    let live = d.running(&rec)?;
+    let meta = Daemon::meta(&rec);
+    if !meta.shares.is_empty() || meta.net_mode.as_deref() == Some("full") {
+        return Err(err(
+            ErrorCode::InvalidState,
+            format!("{} has shared folders or full networking", rec.info.name),
+        )
+        .hint("only pockets without --share-dir and --net full can be saved"));
+    }
+    if meta.secrets.iter().any(|s| s.copy_in) {
+        return Err(err(
+            ErrorCode::InvalidState,
+            format!("{} holds a real secret (--copy-secret)", rec.info.name),
+        )
+        .hint("a template contains the pocket's memory; save a pocket without --copy-secret"));
+    }
+    let image = crate::presets::resolve(d, &rec.info.preset)?;
+    if image.digest != rec.info.image_digest {
+        return Err(err(
+            ErrorCode::InvalidState,
+            format!(
+                "{}'s image is older than the current {} image",
+                rec.info.name, rec.info.preset
+            ),
+        )
+        .hint("restart it from a fresh pocket first"));
+    }
+    let key = {
+        use sha2::Digest;
+        let mut h = sha2::Sha256::new();
+        h.update(format!("{FORMAT}\0saved\0{name}\0{}\0{}", rec.info.id, now_ms()).as_bytes());
+        h.finalize()[..10]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    };
+    let shape = Shape {
+        vcpus: rec.info.vcpus,
+        memory_mib: rec.info.memory_mib,
+        disk_bytes: rec.info.disk_bytes,
+    };
+    snapshot_pocket(
+        d,
+        &live,
+        &rec,
+        &key,
+        shape,
+        &image,
+        &rec.info.preset,
+        "saved",
+        Some(name),
+    )
+    .await?;
+    let all = d.db(|s| s.templates())?;
+    all.iter()
+        .find(|t| t.key == key)
+        .map(info)
+        .ok_or_else(|| err(ErrorCode::Internal, "saved template vanished"))
+}
+
+/// A saved template by name.
+pub fn saved(d: &Daemon, name: &str) -> R<Template> {
+    let rec = d
+        .db(|s| s.templates())?
+        .into_iter()
+        .filter(|t| t.kind == "saved" && t.name.as_deref() == Some(name))
+        .max_by_key(|t| t.built_at)
+        .ok_or_else(|| {
+            err(
+                ErrorCode::NotFound,
+                format!("no saved template named {name:?}"),
+            )
+            .hint("`pocket templates` lists them; `pocket save P --as NAME` makes one")
+        })?;
+    find(d, &rec.key).ok_or_else(|| {
+        err(
+            ErrorCode::InvalidState,
+            format!("template {name} no longer matches this host, kernel or VMM"),
+        )
+        .hint("save it again from a running pocket")
+    })
 }

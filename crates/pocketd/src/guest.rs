@@ -217,9 +217,30 @@ async fn read_frame<T: serde::de::DeserializeOwned + pocket_proto::frame::Valida
     Ok(Some(decode(&buf)?))
 }
 
+/// Next frame of an exec stream (guest output: validated like every guest frame).
+pub async fn read_exec_out(
+    r: &mut (impl AsyncReadExt + Unpin),
+) -> Result<Option<pocket_proto::guest::ExecOut>, GuestConnError> {
+    read_frame(r).await
+}
+
 impl GuestConn {
+    /// Starts a process and opens its `ExecIo` stream with stdin left open: the caller
+    /// sends `ExecIn` frames.
+    pub async fn exec_stream_open(&self, req: ExecReq<'_>) -> Result<UnixStream, GuestConnError> {
+        self.exec_stream_inner(req, false).await
+    }
+
     /// Starts a process and opens its `ExecIo` stream.
     pub async fn exec_stream(&self, req: ExecReq<'_>) -> Result<UnixStream, GuestConnError> {
+        self.exec_stream_inner(req, true).await
+    }
+
+    async fn exec_stream_inner(
+        &self,
+        req: ExecReq<'_>,
+        close_stdin: bool,
+    ) -> Result<UnixStream, GuestConnError> {
         use pocket_proto::guest::{STREAM_PORT, StreamAck, StreamOpen};
         let (id, reply) = self
             .request_id(
@@ -243,6 +264,9 @@ impl GuestConn {
             Some(StreamAck(Ok(()))) => {}
             Some(StreamAck(Err(e))) => return Err(GuestConnError::Guest(e)),
             None => return Err(GuestConnError::Closed),
+        }
+        if !close_stdin {
+            return Ok(s);
         }
         if let Some(data) = req.stdin {
             use pocket_proto::guest::{ExecIn, MAX_CHUNK};

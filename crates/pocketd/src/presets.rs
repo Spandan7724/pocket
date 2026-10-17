@@ -204,7 +204,8 @@ async fn build(
     let rec = PocketRecord {
         info: PocketInfo {
             id: id.clone(),
-            name: format!("build-{}", p.name),
+            // Unique: the cgroup scope is named after it, and scopes are per user.
+            name: format!("build-{}-{}", p.name, &id[1..7]),
             state: PocketState::Creating,
             preset: p.name.into(),
             image_digest: parent.digest.clone(),

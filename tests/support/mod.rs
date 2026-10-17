@@ -174,6 +174,7 @@ impl TestVm {
             serial_log: o.serial.then(|| dir.join("serial.log")),
             balloon: false,
             fs: vec![],
+            net_vhost: None,
         };
         let log = fs::File::create(dir.join("vmm.log")).unwrap();
         let started = Instant::now();

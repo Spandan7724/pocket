@@ -66,6 +66,15 @@ fn early_mounts() -> io::Result<()> {
         libc::MS_NOSUID | libc::MS_NODEV,
         Some("mode=0755"),
     )?;
+    // What udev/systemd would create; bash process substitution and `-` as a file need them.
+    for (link, target) in [
+        ("/dev/fd", "/proc/self/fd"),
+        ("/dev/stdin", "/proc/self/fd/0"),
+        ("/dev/stdout", "/proc/self/fd/1"),
+        ("/dev/stderr", "/proc/self/fd/2"),
+    ] {
+        let _ = std::os::unix::fs::symlink(target, link);
+    }
     mkdirs(&[
         "/dev/pts",
         "/dev/shm",

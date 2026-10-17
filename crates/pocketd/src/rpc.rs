@@ -169,7 +169,11 @@ fn wakes(req: &Request) -> Option<&str> {
         | Request::Sync { pocket, .. }
         | Request::Ports { pocket }
         | Request::PortAdd { pocket, .. }
-        | Request::PasteImage { pocket, .. } => Some(pocket),
+        | Request::PasteImage { pocket, .. }
+        | Request::CopyIn { pocket, .. }
+        | Request::CopyOut { pocket, .. }
+        | Request::Save { pocket, .. }
+        | Request::SshPrepare { pocket, .. } => Some(pocket),
         _ => None,
     }
 }
@@ -214,9 +218,10 @@ async fn handle(
             rows,
             cols,
             term,
+            terminfo,
         } => Response::Session {
             name: d
-                .session_create(&pocket, name, argv, rows, cols, term)
+                .session_create(&pocket, name, argv, rows, cols, term, terminfo)
                 .await?,
         },
         Request::SessionList { pocket, peek } => {
@@ -394,6 +399,20 @@ async fn handle(
         Request::Resume { pocket } => Response::Pocket(d.resume(&pocket).await?),
         Request::Hibernate { pocket } => Response::Pocket(d.hibernate(&pocket).await?),
         Request::Pool => Response::Pool(d.pool.info(d)),
+        Request::CopyIn { pocket, src, dst } => Response::Text {
+            text: crate::files::copy_in(d, &pocket, &src, &dst).await?,
+            url: None,
+        },
+        Request::CopyOut { pocket, src, dst } => Response::Text {
+            text: crate::files::copy_out(d, &pocket, &src, &dst).await?,
+            url: None,
+        },
+        Request::Save { pocket, name } => {
+            Response::Templates(vec![crate::templates::save(d, &pocket, &name).await?])
+        }
+        Request::SshPrepare { pocket, public_key } => {
+            crate::ssh::prepare(d, &pocket, &public_key).await?
+        }
         Request::Bench {
             runs,
             preset,

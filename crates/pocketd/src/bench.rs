@@ -63,6 +63,7 @@ fn spec(d: &Daemon, image: &Path, shape: Shape, dir: &Path, rt: &Path, id: &str)
         log_path: dir.join("vmm.log"),
         serial_log: None,
         shared_fs: vec![],
+        net_vhost: None,
     }
 }
 

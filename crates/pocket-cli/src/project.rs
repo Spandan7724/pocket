@@ -35,7 +35,10 @@ const SCHEMA: &[(&str, &[&str])] = &[
         ],
     ),
     ("agents", &["install", "sync_config"]),
-    ("network", &["profile", "allow", "deny", "allow_host_ports"]),
+    (
+        "network",
+        &["profile", "mode", "allow", "deny", "allow_host_ports"],
+    ),
     ("secrets", &["inject"]),
     (
         "git",
@@ -100,6 +103,10 @@ pub struct Project {
     pub ssh_agent: Option<bool>,
     pub auto_forward: Option<bool>,
     pub forward: Vec<(u16, u16)>,
+    /// `proxy` | `transparent` (`full` comes from `profile = "full"`).
+    pub net_mode: Option<String>,
+    pub idle_pause_ms: Option<u64>,
+    pub idle_hibernate_ms: Option<u64>,
     pub notes: Vec<String>,
 }
 
@@ -302,9 +309,25 @@ pub fn parse(path: &Path, text: &str) -> Result<Project> {
             p.forward.push((g, h));
         }
     }
-    if doc.get("idle").is_some() {
-        p.notes
-            .push("[idle] takes effect with pause/hibernate support (M9)".into());
+    if let Some(v) = get("network", "mode") {
+        let m = string(path, "network.mode", v)?;
+        if !["proxy", "transparent"].contains(&m.as_str()) {
+            return Err(bad(path, format!("unknown network.mode {m:?}"))
+                .hint("use \"proxy\" or \"transparent\"; a real NIC is profile = \"full\""));
+        }
+        p.net_mode = Some(m);
+    }
+    for (key, slot) in [
+        ("pause_after", &mut p.idle_pause_ms),
+        ("hibernate_after", &mut p.idle_hibernate_ms),
+    ] {
+        if let Some(v) = get("idle", key) {
+            let t = string(path, &format!("idle.{key}"), v)?;
+            *slot = Some(pocket_proto::rpc::parse_duration_ms(&t).ok_or_else(|| {
+                bad(path, format!("idle.{key}: {t:?} is not a duration"))
+                    .hint("e.g. \"30m\", \"2h\", \"90s\" or \"never\"")
+            })?);
+        }
     }
     Ok(p)
 }
@@ -338,6 +361,15 @@ pub fn apply(p: &Project, repo: &Path, req: &mut NewPocket, flags_secrets: bool)
     }
     if req.net_profile.is_none() {
         req.net_profile = p.profile.clone();
+    }
+    if req.net_mode.is_none() {
+        req.net_mode = p.net_mode.clone();
+    }
+    if req.idle_pause_ms.is_none() {
+        req.idle_pause_ms = p.idle_pause_ms;
+    }
+    if req.idle_hibernate_ms.is_none() {
+        req.idle_hibernate_ms = p.idle_hibernate_ms;
     }
     req.allow.extend(p.allow.iter().cloned());
     req.deny.extend(p.deny.iter().cloned());
@@ -579,6 +611,18 @@ forward = [{ guest = 5173, host = 5174 }]
                 .contains("host")
         );
         assert!(p("version = 1\n[sandbox]\nsetup_inputs = [\"../x\"]\n").is_err());
+    }
+
+    #[test]
+    fn idle_and_network_mode() {
+        let ok = p("version = 1\n[network]\nmode = \"transparent\"\n[idle]\npause_after = \"10m\"\nhibernate_after = \"never\"\n").unwrap();
+        assert_eq!(ok.net_mode.as_deref(), Some("transparent"));
+        assert_eq!(
+            (ok.idle_pause_ms, ok.idle_hibernate_ms),
+            (Some(600_000), Some(0))
+        );
+        assert!(p("version = 1\n[idle]\npause_after = \"soon\"\n").is_err());
+        assert!(p("version = 1\n[network]\nmode = \"tun\"\n").is_err());
     }
 
     #[test]

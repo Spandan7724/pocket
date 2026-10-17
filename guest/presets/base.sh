@@ -13,7 +13,8 @@ rm -f /etc/apt/apt.conf.d/docker-clean
 apt-get update
 apt-get install -y --no-install-recommends \
     ca-certificates curl wget git gh sudo less vim htop tmux tree ncurses-term locales \
-    procps psmisc iproute2 openssh-client unzip zip xz-utils jq ripgrep file \
+    procps psmisc iproute2 openssh-client openssh-server nftables unzip zip xz-utils jq \
+    ripgrep file \
     bash-completion man-db \
     build-essential pkg-config clang cmake ninja-build gdb \
     python3 python3-pip python3-venv python3-dev pipx \
@@ -115,6 +116,22 @@ cat > /etc/profile.d/pocket.sh <<'SH'
 export DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_NOLOGO=1
 SH
 
+# sshd serves `pocket code` / `pocket ssh` over vsock only (no NIC); pocket starts it and
+# creates host keys per pocket, so clones of one image never share them.
+rm -f /etc/ssh/ssh_host_*
+mkdir -p /run/sshd /etc/ssh/sshd_config.d
+cat > /etc/ssh/sshd_config.d/pocket.conf <<'SSHD'
+ListenAddress 127.0.0.1
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitRootLogin no
+AuthorizedKeysFile .ssh/authorized_keys /run/pocket/ssh/authorized_keys
+AllowTcpForwarding yes
+PrintMotd no
+SSHD
+# No "To run a command as administrator…" or motd on every login shell.
+touch /etc/skel/.sudo_as_admin_successful /etc/skel/.hushlogin
+
 userdel -r ubuntu 2>/dev/null || true
 useradd -m -u 1000 -s /bin/bash -G sudo dev
 echo 'dev ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/90-dev
@@ -130,7 +147,7 @@ for v in "git --version" "gh --version" "gcc --version" "clang --version" "cmake
     "python3 --version" "node --version" "bun --version" "tsc --version" "rustc --version" \
     "cargo --version" "go version" "java -version" "mvn --version" "ruby --version" \
     "php --version" "composer --version" "dotnet --version" "rg --version" \
-    "claude --version" "codex --version" "gemini --version" "opencode --version" \
+    "sshd -V" "nft --version" "claude --version" "codex --version" "gemini --version" "opencode --version" \
     "amp --version" "copilot --version" "qwen --version" "crush --version" \
     "kilo --version" "pi --version" "cursor-agent --version" "goose --version" \
     "aider --version"; do

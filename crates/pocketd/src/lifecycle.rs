@@ -156,12 +156,18 @@ impl Daemon {
             return Ok(self.info(rec));
         }
         let live = self.running(&rec)?;
-        if !Self::meta(&rec).shares.is_empty() {
+        let m = Self::meta(&rec);
+        if !m.shares.is_empty() || m.net_mode.as_deref() == Some("full") {
             return Err(err(
                 ErrorCode::InvalidState,
-                format!("pocket {} has shared folders", rec.info.name),
+                format!(
+                    "pocket {} has shared folders or a network card",
+                    rec.info.name
+                ),
             )
-            .hint("pockets with --share-dir can be paused or stopped, not hibernated"));
+            .hint(
+                "pockets with --share-dir or --net full can be paused or stopped, not hibernated",
+            ));
         }
         let started = Instant::now();
         if live.paused.load(Ordering::SeqCst) {
@@ -301,7 +307,11 @@ pub fn spawn_idle_manager(d: &Arc<Daemon>) {
                             continue;
                         };
                         let net = d.activity(&rec.info.id).open.load(Ordering::SeqCst) > 0;
+                        let m = Daemon::meta(&rec);
+                        let hibernatable =
+                            m.shares.is_empty() && m.net_mode.as_deref() != Some("full");
                         if !net
+                            && hibernatable
                             && hib_ms > 0
                             && t.last_active.elapsed() >= Duration::from_millis(hib_ms)
                         {

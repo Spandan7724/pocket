@@ -176,6 +176,7 @@ async fn spawn_one(d: &Arc<Daemon>, t: &Template, img: &crate::presets::Image) -
         log_path: dir.join("vmm.log"),
         serial_log: None,
         shared_fs: vec![],
+        net_vhost: None,
     };
     let result = async {
         let vm = d

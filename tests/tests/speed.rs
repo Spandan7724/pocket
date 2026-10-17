@@ -91,6 +91,7 @@ fn sealed_guest_refuses_everything_until_the_restore_hook() {
             env: vec![],
             proxy_port: 0,
             machine_id: "0".repeat(32),
+            net_mode: pocket_proto::guest::NetMode::Proxy,
         },
     ];
     for req in refused {

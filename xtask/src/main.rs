@@ -32,10 +32,12 @@ fn main() -> ExitCode {
         }
         Some("system") => assets::system().map(|_| ()),
         Some("vmm") => assets::vmm().map(|_| ()),
+        Some("passt") => assets::passt().map(|_| ()),
         Some("test-base") => assets::test_base().map(|_| ()),
         Some("assets") => (|| {
             kernel::build(false)?;
             assets::vmm()?;
+            assets::passt()?;
             assets::system()?;
             assets::test_base()?;
             Ok(())

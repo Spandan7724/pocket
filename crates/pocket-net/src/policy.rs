@@ -361,6 +361,20 @@ impl Policy {
         })
     }
 
+    /// Whether `host` may be looked up at all (transparent-mode DNS): not denied, and some
+    /// allow rule names it on any port.
+    pub fn decide_name(&self, host: &str) -> Result<(), String> {
+        let host = normalize_host(host);
+        if let Some(r) = self.deny.iter().find(|r| r.matches_host(&host)) {
+            return Err(format!("denied by rule {:?}", r.pattern));
+        }
+        if self.allow.iter().any(|r| r.matches_host(&host)) {
+            Ok(())
+        } else {
+            Err(format!("{host} is not allowed by profile {}", self.profile))
+        }
+    }
+
     /// Name-level decision (before resolution). `Err` carries the reason.
     pub fn decide(&self, host: &str, port: u16) -> Result<(), String> {
         let host = normalize_host(host);

@@ -512,6 +512,16 @@ impl Daemon {
             })?),
             None => None,
         };
+        let mut req = req;
+        let saved = match req.template.as_deref() {
+            Some(n) => Some(crate::templates::saved(self, n)?),
+            None => None,
+        };
+        if let Some(t) = &saved {
+            // A saved template fixes the image and the VM shape; setup is already in it.
+            req.preset = Some(t.meta.preset.clone());
+            req.setup = None;
+        }
         let preset = req.preset.clone().unwrap_or_else(|| "base".into());
         let image = match presets::resolve(self, &preset) {
             Ok(i) => i,
@@ -520,6 +530,11 @@ impl Daemon {
             }
             Err(e) => return Err(e),
         };
+        if req.net_profile.as_deref() == Some("full") {
+            // A NIC, not a proxy profile; what still uses the proxy gets the dev profile.
+            req.net_profile = Some("dev".into());
+            req.net_mode = Some("full".into());
+        }
         let profile = req.net_profile.clone().unwrap_or_else(|| "dev".into());
         net::policy_for(&profile, &req.allow)?;
         for d in &req.deny {
@@ -540,7 +555,36 @@ impl Daemon {
                 .clamp(1024, 1 << 24)
                 << 20,
         };
+        let shape = match &saved {
+            Some(t) => {
+                if t.meta.image_digest != image.digest {
+                    return Err(err(
+                        ErrorCode::InvalidState,
+                        format!(
+                            "template {} was saved with an older {preset} image",
+                            req.template.clone().unwrap_or_default()
+                        ),
+                    )
+                    .hint("save it again from a pocket on the current image"));
+                }
+                t.meta.shape
+            }
+            None => shape,
+        };
         let net_mode = req.net_mode.clone().unwrap_or_else(|| "proxy".into());
+        if !["proxy", "transparent", "full"].contains(&net_mode.as_str()) {
+            return Err(err(
+                ErrorCode::BadRequest,
+                format!("unknown network mode {net_mode:?}"),
+            )
+            .hint("use proxy, transparent or full"));
+        }
+        if saved.is_some() && (!req.share.is_empty() || net_mode == "full") {
+            return Err(err(
+                ErrorCode::BadRequest,
+                "--share-dir and --net full cannot start from a saved template",
+            ));
+        }
         // Shared folders need shared guest memory (no copy-on-write restore); a project
         // setup builds its own template; full networking adds a NIC the template lacks.
         let snapshot_eligible =
@@ -553,7 +597,7 @@ impl Daemon {
             .filter(|_| snapshot_eligible && req.copy_secrets.is_empty())
             .filter(|_| repo.as_ref().is_some_and(|r| r.head.is_some()))
             .map(|s| crate::templates::project_key(&base_key, s));
-        let pooled = if snapshot_eligible && req.setup.is_none() {
+        let pooled = if snapshot_eligible && req.setup.is_none() && saved.is_none() {
             self.pool.take(&base_key)
         } else {
             None
@@ -646,8 +690,9 @@ impl Daemon {
                 .as_deref()
                 .and_then(|k| crate::templates::find(self, k));
             let from_template = project_snap.is_some()
+                || saved.is_some()
                 || (project_key.is_none() && template.as_ref().is_some_and(|(p, _)| p.exists()));
-            let snap = match project_snap {
+            let snap = match project_snap.or(saved) {
                 Some(t) => Some(t),
                 None => snapshot_eligible
                     .then(|| crate::templates::find(self, &base_key))
@@ -725,13 +770,14 @@ impl Daemon {
                     .await?;
             }
             progress("starting session");
-            self.create_session(
+            self.create_session_with(
                 &live,
                 Some("shell"),
                 req.command.clone(),
                 24,
                 80,
                 req.term.clone(),
+                req.terminfo.clone(),
             )
             .await?;
             Ok::<_, RpcError>(())
@@ -797,6 +843,7 @@ impl Daemon {
             serial_log: std::env::var_os("POCKET_SERIAL_LOG")
                 .map(|_| self.paths.pocket_dir(id).join("serial.log")),
             shared_fs: vec![],
+            net_vhost: None,
         }
     }
 
@@ -825,6 +872,11 @@ impl Daemon {
         for (i, sh) in meta.shares.iter().enumerate() {
             let (sock, task) = crate::share::start_virtiofsd(&self.paths, &rt, i, sh).await?;
             spec.shared_fs.push((format!("pocketfs{i}"), sock));
+            fs_tasks.push(task);
+        }
+        if meta.net_mode.as_deref() == Some("full") {
+            let (sock, task) = crate::fullnet::start(&self.paths, &rt).await?;
+            spec.net_vhost = Some(sock);
             fs_tasks.push(task);
         }
         for p in [&spec.kernel, &self.paths.system_image(), &self.paths.vmm()] {
@@ -1004,6 +1056,11 @@ impl Daemon {
                     env,
                     proxy_port: GUEST_PROXY_PORT,
                     machine_id: machine_id.clone(),
+                    net_mode: match meta.net_mode.as_deref() {
+                        Some("transparent") => pocket_proto::guest::NetMode::Transparent,
+                        Some("full") => pocket_proto::guest::NetMode::Full,
+                        _ => pocket_proto::guest::NetMode::Proxy,
+                    },
                 })
                 .await
                 .map_err(|e| err(ErrorCode::Guest, format!("configure guest: {e}")))?;
@@ -1577,6 +1634,22 @@ impl Daemon {
         cols: u16,
         term: Option<String>,
     ) -> R<String> {
+        self.create_session_with(live, name, argv, rows, cols, term, None)
+            .await
+    }
+
+    /// `terminfo`: the client's compiled entry for `term`, used when the image lacks one.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_session_with(
+        &self,
+        live: &Live,
+        name: Option<&str>,
+        argv: Option<Vec<String>>,
+        rows: u16,
+        cols: u16,
+        term: Option<String>,
+        terminfo: Option<Vec<u8>>,
+    ) -> R<String> {
         let existing = list_sessions(live).await?;
         let name = match name {
             Some(n) => n.to_string(),
@@ -1596,10 +1669,9 @@ impl Daemon {
                 .map(String::from)
                 .to_vec()
         });
-        let env = vec![(
-            "TERM".to_string(),
-            term.unwrap_or_else(|| "xterm-256color".into()),
-        )];
+        let term = term.unwrap_or_else(|| "xterm-256color".into());
+        ensure_terminfo(live, &term, terminfo).await;
+        let env = vec![("TERM".to_string(), term)];
         live.guest
             .request(HostReq::SessionCreate {
                 name: name.clone(),
@@ -1617,6 +1689,7 @@ impl Daemon {
         Ok(name)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn session_create(
         &self,
         pocket: &str,
@@ -1625,6 +1698,7 @@ impl Daemon {
         rows: u16,
         cols: u16,
         term: Option<String>,
+        terminfo: Option<Vec<u8>>,
     ) -> R<String> {
         let rec = self.find(pocket)?;
         let live = self.running(&rec)?;
@@ -1636,7 +1710,7 @@ impl Daemon {
                 format!("invalid session name {n:?}"),
             ));
         }
-        self.create_session(&live, name.as_deref(), argv, rows, cols, term)
+        self.create_session_with(&live, name.as_deref(), argv, rows, cols, term, terminfo)
             .await
     }
 
@@ -1771,6 +1845,61 @@ async fn list_sessions(live: &Live) -> R<Vec<SessionInfo>> {
     {
         Reply::Sessions(s) => Ok(s),
         other => Err(err(ErrorCode::Guest, format!("unexpected reply {other:?}"))),
+    }
+}
+
+/// Sessions get the user's `TERM`; when the image has no terminfo entry for it (a new
+/// terminal), the client's compiled entry (else the daemon host's) is copied in. Data only.
+async fn ensure_terminfo(live: &Live, term: &str, from_client: Option<Vec<u8>>) {
+    if !pocket_proto::rpc::valid_term(term) {
+        return;
+    }
+    let first = term.chars().next().unwrap_or('x');
+    for dir in [
+        "/usr/share/terminfo",
+        "/lib/terminfo",
+        "/etc/terminfo",
+        "/usr/lib/terminfo",
+    ] {
+        let probe = HostReq::FileRead {
+            path: format!("{dir}/{first}/{term}"),
+            max_bytes: 1,
+        };
+        if live.guest.request(probe).await.is_ok() {
+            return;
+        }
+    }
+    let Some(data) = from_client
+        .filter(|d| !d.is_empty() && d.len() <= pocket_proto::rpc::MAX_TERMINFO)
+        .or_else(|| pocket_proto::rpc::find_terminfo(term))
+    else {
+        tracing::info!(
+            "{}: no terminfo for {term} in the image or on the host",
+            live.name
+        );
+        return;
+    };
+    let dir = format!("/usr/share/terminfo/{first}");
+    let _ = crate::provision::sh_args(
+        &live.guest,
+        None,
+        "mkdir -p \"$1\"",
+        &[&dir],
+        vec![],
+        "terminfo dir",
+    )
+    .await;
+    match live
+        .guest
+        .request(HostReq::FileWrite {
+            path: format!("{dir}/{term}"),
+            mode: 0o644,
+            data,
+        })
+        .await
+    {
+        Ok(_) => tracing::info!("{}: installed the host's terminfo for {term}", live.name),
+        Err(e) => tracing::warn!("{}: install terminfo {term}: {e}", live.name),
     }
 }
 
