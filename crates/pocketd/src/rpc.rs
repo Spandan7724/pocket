@@ -388,6 +388,17 @@ async fn handle(
             Response::Done
         }
         Request::Templates => Response::Templates(crate::templates::list(d)?),
+        Request::Images => Response::Images(crate::images::list(d)?),
+        Request::Gc { dry_run, only } => {
+            let d = d.clone();
+            Response::Gc(
+                tokio::task::spawn_blocking(move || {
+                    crate::images::gc(&d, dry_run, true, only.as_deref())
+                })
+                .await
+                .map_err(|e| err(ErrorCode::Internal, e.to_string()))??,
+            )
+        }
         Request::TemplateBuild {
             preset,
             cpus,

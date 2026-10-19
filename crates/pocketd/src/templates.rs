@@ -677,17 +677,7 @@ pub async fn save(d: &Arc<Daemon>, pocket: &str, name: &str) -> R<pocket_proto::
         )
         .hint("a template contains the pocket's memory; save a pocket without --copy-secret"));
     }
-    let image = crate::presets::resolve(d, &rec.info.preset)?;
-    if image.digest != rec.info.image_digest {
-        return Err(err(
-            ErrorCode::InvalidState,
-            format!(
-                "{}'s image is older than the current {} image",
-                rec.info.name, rec.info.preset
-            ),
-        )
-        .hint("restart it from a fresh pocket first"));
-    }
+    let image = crate::presets::resolve_version(d, &rec.info.preset, &rec.info.image_digest)?;
     let key = {
         use sha2::Digest;
         let mut h = sha2::Sha256::new();

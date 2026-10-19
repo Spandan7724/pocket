@@ -10,6 +10,7 @@ mod fullnet;
 mod guard;
 mod guest;
 mod host;
+mod images;
 mod inject;
 mod lifecycle;
 mod net;
@@ -180,6 +181,7 @@ async fn run(paths: paths::Paths) -> ExitCode {
         d.backend.version()
     );
     d.readopt().await;
+    images::spawn_auto(&d);
     pool::spawn(&d);
     lifecycle::spawn_idle_manager(&d);
     let stop = Arc::new(tokio::sync::Notify::new());

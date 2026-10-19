@@ -163,6 +163,18 @@ enum Cmd {
     Hibernate { pocket: String },
     /// List snapshot templates and the warm pool.
     Templates,
+    /// List built image versions, their size and what still uses them.
+    Images,
+    /// Remove image versions nothing uses (old ones go automatically; this also cleans a
+    /// shared POCKET_PRESET_CACHE) and the snapshot templates built on them.
+    Gc {
+        /// Show what would be removed without removing it.
+        #[arg(long)]
+        dry_run: bool,
+        /// Don't ask for confirmation.
+        #[arg(long, short)]
+        force: bool,
+    },
     /// Copy files between the host and a pocket: `pocket cp ./x P:/work/x`, `pocket cp P:out .`
     Cp { src: String, dst: String },
     /// Snapshot a configured pocket (memory, disk, setup) as a reusable template.
@@ -1318,6 +1330,117 @@ fn command(c: &mut Client, cmd: Cmd, j: bool) -> Result<u8> {
                     .as_deref()
                     .map(|t| format!(", template {t}"))
                     .unwrap_or_default()
+            );
+            Ok(0)
+        }
+        Cmd::Images => {
+            let Response::Images(list) = c.request(Request::Images)? else {
+                return Err(CliError::new("internal", 70, "unexpected reply"));
+            };
+            if j {
+                json(&list);
+                return Ok(0);
+            }
+            if list.is_empty() {
+                println!(
+                    "no images built yet — `pocket pull base` or the first `pocket new` builds one"
+                );
+                return Ok(0);
+            }
+            println!(
+                "{:<8} {:<16} {:>8} {:>9}  STATUS",
+                "PRESET", "VERSION", "SIZE", "BUILT"
+            );
+            for i in &list {
+                let mut status = if i.current {
+                    "current".to_string()
+                } else if i.used_by.is_empty() {
+                    "unused".to_string()
+                } else {
+                    format!("used by {}", i.used_by.join(", "))
+                };
+                if i.shared {
+                    status.push_str(" · shared cache");
+                }
+                println!(
+                    "{:<8} {:<16} {:>8} {:>9}  {status}",
+                    i.preset,
+                    i.version,
+                    human_bytes(i.size_bytes),
+                    i.built_at.map(ago).unwrap_or_else(|| "?".into())
+                );
+            }
+            let unused: u64 = list
+                .iter()
+                .filter(|i| !i.current && i.used_by.is_empty())
+                .map(|i| i.size_bytes)
+                .sum();
+            if unused > 0 {
+                println!("{} unused — `pocket gc` removes it", human_bytes(unused));
+            }
+            Ok(0)
+        }
+        Cmd::Gc { dry_run, force } => {
+            let mut gc = |dry_run, only| -> Result<pocket_proto::rpc::GcReport> {
+                match c.request(Request::Gc { dry_run, only })? {
+                    Response::Gc(r) => Ok(r),
+                    _ => Err(CliError::new("internal", 70, "unexpected reply")),
+                }
+            };
+            let plan = gc(true, None)?;
+            let nothing = plan.removed.is_empty() && plan.templates.is_empty();
+            let r = if dry_run || nothing {
+                plan
+            } else {
+                if !force {
+                    for i in &plan.removed {
+                        eprintln!(
+                            "  {} {} ({}) {}",
+                            i.preset,
+                            i.version,
+                            human_bytes(i.size_bytes),
+                            i.path.display()
+                        );
+                    }
+                    let q = format!(
+                        "remove these unused image versions ({})? They are rebuilt (~20 min) if needed again",
+                        human_bytes(plan.freed_bytes)
+                    );
+                    if !confirm(&q) {
+                        return Err(CliError::usage("not removing anything")
+                            .hint("confirm interactively, or pass --force"));
+                    }
+                }
+                gc(
+                    false,
+                    Some(plan.removed.iter().map(|i| i.version.clone()).collect()),
+                )?
+            };
+            if j {
+                json(&r);
+                return Ok(0);
+            }
+            if r.removed.is_empty() && r.templates.is_empty() {
+                println!("nothing to remove");
+                return Ok(0);
+            }
+            let verb = if dry_run { "would remove" } else { "removed" };
+            for i in &r.removed {
+                println!(
+                    "{verb} {} {} ({}) {}",
+                    i.preset,
+                    i.version,
+                    human_bytes(i.size_bytes),
+                    i.path.display()
+                );
+            }
+            for t in &r.templates {
+                println!("{verb} template {t}");
+            }
+            println!(
+                "{} {}",
+                if dry_run { "would free" } else { "freed" },
+                human_bytes(r.freed_bytes)
             );
             Ok(0)
         }

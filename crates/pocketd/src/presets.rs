@@ -60,12 +60,32 @@ fn key(p: &Preset) -> String {
     hex(&h.finalize())
 }
 
-/// Optional directory of prebuilt presets (`<name>-<key>.erofs`), shared across data dirs
-/// (CI caches it).
-fn cache_path(name: &str, key: &str) -> Option<PathBuf> {
+/// The digest new pockets of a built-in preset use (`None` for unknown names).
+pub fn current_digest(name: &str) -> Option<String> {
+    find(name).map(|p| format!("sha256:{}", key(p)))
+}
+
+/// Short version id: the first 16 hex digits of the key, as in file names.
+pub fn version(digest: &str) -> &str {
+    let k = digest.strip_prefix("sha256:").unwrap_or(digest);
+    &k[..k.len().min(16)]
+}
+
+/// Optional directory of prebuilt presets (`<name>-<version>.erofs`), shared across data
+/// dirs (CI caches it).
+pub fn cache_dir() -> Option<PathBuf> {
     std::env::var_os("POCKET_PRESET_CACHE")
         .filter(|v| !v.is_empty())
-        .map(|d| PathBuf::from(d).join(format!("{name}-{}.erofs", &key[..16])))
+        .map(PathBuf::from)
+}
+
+fn cache_path(name: &str, key: &str) -> Option<PathBuf> {
+    cache_dir().map(|d| d.join(format!("{name}-{}.erofs", version(key))))
+}
+
+/// File name of a preset version built into the data dir.
+pub fn data_file(name: &str, key: &str) -> String {
+    format!("preset-{name}-{}.erofs", version(key))
 }
 
 pub fn resolve(d: &Daemon, name: &str) -> R<Image> {
@@ -89,21 +109,9 @@ pub fn resolve(d: &Daemon, name: &str) -> R<Image> {
                 .hint(format!("available presets: {}", names().join(", "))),
         );
     };
-    let k = key(p);
-    let digest = format!("sha256:{k}");
-    if let Some(img) = d.db(|s| s.image(name))?
-        && img.digest == digest
-        && img.path.exists()
-    {
-        return Ok(Image {
-            path: img.path,
-            digest,
-        });
-    }
-    if let Some(c) = cache_path(name, &k)
-        && c.exists()
-    {
-        return Ok(Image { path: c, digest });
+    let digest = format!("sha256:{}", key(p));
+    if let Some(img) = find_version(d, name, &digest)? {
+        return Ok(img);
     }
     Err(err(
         ErrorCode::NotFound,
@@ -112,6 +120,48 @@ pub fn resolve(d: &Daemon, name: &str) -> R<Image> {
     .hint(format!(
         "run `pocket pull {name}` (builds it from Ubuntu 24.04; takes a few minutes)"
     )))
+}
+
+/// A specific built version of a preset: the one a hibernated pocket or a saved template
+/// was made with. Their memory refers to that exact image, so another version will not do.
+pub fn resolve_version(d: &Daemon, name: &str, digest: &str) -> R<Image> {
+    if name == TEST_PRESET {
+        return resolve(d, name);
+    }
+    find_version(d, name, digest)?.ok_or_else(|| {
+        err(
+            ErrorCode::NotFound,
+            format!("version {} of the {name} image is gone", version(digest)),
+        )
+    })
+}
+
+fn find_version(d: &Daemon, name: &str, digest: &str) -> R<Option<Image>> {
+    if let Some(img) = d.db(|s| s.image(digest))?
+        && img.name == name
+        && img.path.exists()
+    {
+        return Ok(Some(Image {
+            path: img.path,
+            digest: digest.into(),
+        }));
+    }
+    let k = digest.strip_prefix("sha256:").unwrap_or(digest);
+    for path in [
+        cache_path(name, k),
+        Some(d.paths.images().join(data_file(name, k))),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if path.exists() {
+            return Ok(Some(Image {
+                path,
+                digest: digest.into(),
+            }));
+        }
+    }
+    Ok(None)
 }
 
 pub async fn pull(
@@ -168,10 +218,7 @@ pub async fn pull(
             }
             c
         }
-        None => d
-            .paths
-            .images()
-            .join(format!("preset-{name}-{}.erofs", &k[..16])),
+        None => d.paths.images().join(data_file(name, &k)),
     };
     build(d, p, &parent, &out, progress).await?;
     let size = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
@@ -190,6 +237,7 @@ pub async fn pull(
         "{name}: built ({:.0} MiB)",
         size as f64 / 1048576.0
     ));
+    crate::images::auto(d);
     Ok(Image { path: out, digest })
 }
 

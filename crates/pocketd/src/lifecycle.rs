@@ -106,7 +106,6 @@ impl Daemon {
 
     async fn resume_hibernated(self: &Arc<Self>, rec: &PocketRecord) -> R<Arc<Live>> {
         let started = Instant::now();
-        let image = crate::presets::resolve(self, &rec.info.preset)?;
         let meta = Self::meta(rec);
         let (dir, fp) = meta.hibernation.clone().ok_or_else(|| {
             err(
@@ -121,17 +120,27 @@ impl Daemon {
             host_fingerprint: fp,
             disks: vec![],
         };
-        let live = match self.boot(rec, &image.path, Launch::Hibernation(snap)).await {
+        // The saved memory refers to the exact image it ran on, never a newer build.
+        let resumed =
+            match crate::presets::resolve_version(self, &rec.info.preset, &rec.info.image_digest) {
+                Ok(image) => self
+                    .boot(rec, &image.path, Launch::Hibernation(snap))
+                    .await
+                    .map_err(|e| e.message),
+                Err(e) => Err(e.message),
+            };
+        let live = match resumed {
             Ok(l) => l,
-            Err(e) => {
-                // The image is unusable (host kernel / VMM changed, file damaged): boot
-                // the disk instead; running processes are lost, files are not.
+            Err(why) => {
+                // Unusable (image gone, host kernel / VMM changed, file damaged): boot the
+                // disk on the current image instead; running processes are lost, files not.
                 tracing::warn!(
-                    "{}: resume from hibernation failed ({}); booting the disk",
-                    rec.info.name,
-                    e.message
+                    "{}: resume from hibernation failed ({why}); booting the disk",
+                    rec.info.name
                 );
+                let image = crate::presets::resolve(self, &rec.info.preset)?;
                 let live = self.boot(rec, &image.path, Launch::Cold).await?;
+                self.db(|s| s.set_image_digest(&rec.info.id, &image.digest))?;
                 self.create_session(&live, Some("shell"), None, 24, 80, None)
                     .await?;
                 live

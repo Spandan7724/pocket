@@ -421,3 +421,57 @@ fn events_reach_subscribers_and_kill_ends_sessions() {
     env.ok(&["kill", &format!("{n}:shell")]);
     assert!(env.json(&["sessions", &n]).as_array().unwrap().is_empty());
 }
+
+#[test]
+fn old_image_versions_are_removed_automatically_and_by_gc() {
+    let Some(assets) = assets() else { return };
+    let env = Env::new("images", &assets);
+    // Never the real shared cache: `pocket gc` cleans it.
+    let shared = env.root.join("shared-presets");
+    let env = env.set("POCKET_PRESET_CACHE", shared.to_str().unwrap());
+    let images = env.root.join("data/pocket/images");
+    std::fs::create_dir_all(&images).unwrap();
+    std::fs::create_dir_all(&shared).unwrap();
+    let old = images.join("preset-base-1111111111111111.erofs");
+    let oci = images.join(format!("{}.erofs", "ab".repeat(32)));
+    let other = images.join("notes.txt");
+    let cached = shared.join("base-2222222222222222.erofs");
+    let cached_other = shared.join("README");
+    for f in [&old, &oci, &other, &cached, &cached_other] {
+        std::fs::write(f, vec![0u8; 4096]).unwrap();
+    }
+
+    // The daemon's start-up collection removes the data dir's unused version, nothing else.
+    let list = env.json(&["images"]);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while old.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(!old.exists(), "unused data-dir version kept: {list}");
+    for f in [&oci, &other, &cached, &cached_other] {
+        assert!(f.exists(), "{} removed", f.display());
+    }
+
+    let list = env.json(&["images"]);
+    let list = list.as_array().unwrap();
+    assert_eq!(list.len(), 1, "{list:?}");
+    assert_eq!(list[0]["version"], "2222222222222222");
+    assert_eq!(list[0]["shared"], true);
+    assert_eq!(list[0]["current"], false);
+    assert_eq!(list[0]["used_by"].as_array().unwrap().len(), 0);
+    assert!(env.ok(&["doctor"]).contains("old images"));
+
+    let dry = env.json(&["gc", "--dry-run"]);
+    assert_eq!(dry["removed"][0]["version"], "2222222222222222", "{dry}");
+    assert!(cached.exists());
+
+    // Without a terminal and without --force nothing is removed.
+    let refused = env.pocket(&["gc"]);
+    assert!(!refused.status.success() && cached.exists());
+    let done = env.json(&["gc", "--force"]);
+    assert_eq!(done["freed_bytes"], 4096, "{done}");
+    assert!(!cached.exists() && cached_other.exists());
+    assert_eq!(env.json(&["images"]).as_array().unwrap().len(), 0);
+    assert!(env.ok(&["gc"]).contains("nothing to remove"));
+    env.ok(&["daemon", "stop"]);
+}

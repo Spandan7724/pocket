@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::guest::{ExitStatus, SessionInfo};
 
 /// Bump on every incompatible change to the types in this module.
-pub const RPC_VERSION: u32 = 3;
+pub const RPC_VERSION: u32 = 4;
 pub const MAX_RPC_FRAME: usize = 16 << 20;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -389,6 +389,16 @@ pub enum Request {
         #[serde(default)]
         memory_mib: Option<u32>,
     },
+    /// Every built preset image version, with what still uses it.
+    Images,
+    /// Removes image versions nothing uses (also from a shared `POCKET_PRESET_CACHE`) and
+    /// the snapshot templates built on them.
+    Gc {
+        dry_run: bool,
+        /// Only these versions (what the user confirmed); `None`: everything unused.
+        #[serde(default)]
+        only: Option<Vec<String>>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -435,6 +445,35 @@ pub enum Response {
         /// The guest's host key line (`ssh-ed25519 AAAA…`), pinned in known_hosts.
         host_key: String,
     },
+    Images(Vec<ImageInfo>),
+    Gc(GcReport),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageInfo {
+    pub preset: String,
+    /// First 16 hex digits of the image key; also in the file name.
+    pub version: String,
+    pub path: PathBuf,
+    pub size_bytes: u64,
+    /// Unknown for files found without a database record.
+    pub built_at: Option<u64>,
+    /// The version this pocket build uses for new pockets.
+    pub current: bool,
+    /// Pockets (`pocket NAME`) and saved templates (`template NAME`) that need this version.
+    pub used_by: Vec<String>,
+    /// In `POCKET_PRESET_CACHE`, which other daemons may share; only `pocket gc` removes
+    /// versions there.
+    pub shared: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GcReport {
+    pub dry_run: bool,
+    pub removed: Vec<ImageInfo>,
+    /// Keys of snapshot templates removed with their image.
+    pub templates: Vec<String>,
+    pub freed_bytes: u64,
 }
 
 pub fn valid_term(t: &str) -> bool {

@@ -523,12 +523,21 @@ impl Daemon {
             req.setup = None;
         }
         let preset = req.preset.clone().unwrap_or_else(|| "base".into());
-        let image = match presets::resolve(self, &preset) {
-            Ok(i) => i,
-            Err(e) if e.code == ErrorCode::NotFound => {
-                presets::pull(self, &preset, progress).await?
+        let image = match &saved {
+            // Its memory refers to the image it was saved on; the version stays while the
+            // template exists (images.rs).
+            Some(t) => {
+                presets::resolve_version(self, &preset, &t.meta.image_digest).map_err(|e| {
+                    e.hint("save the template again from a pocket on the current image")
+                })?
             }
-            Err(e) => return Err(e),
+            None => match presets::resolve(self, &preset) {
+                Ok(i) => i,
+                Err(e) if e.code == ErrorCode::NotFound => {
+                    presets::pull(self, &preset, progress).await?
+                }
+                Err(e) => return Err(e),
+            },
         };
         if req.net_profile.as_deref() == Some("full") {
             // A NIC, not a proxy profile; what still uses the proxy gets the dev profile.
@@ -556,19 +565,7 @@ impl Daemon {
                 << 20,
         };
         let shape = match &saved {
-            Some(t) => {
-                if t.meta.image_digest != image.digest {
-                    return Err(err(
-                        ErrorCode::InvalidState,
-                        format!(
-                            "template {} was saved with an older {preset} image",
-                            req.template.clone().unwrap_or_default()
-                        ),
-                    )
-                    .hint("save it again from a pocket on the current image"));
-                }
-                t.meta.shape
-            }
+            Some(t) => t.meta.shape,
             None => shape,
         };
         let net_mode = req.net_mode.clone().unwrap_or_else(|| "proxy".into());
@@ -1495,6 +1492,7 @@ impl Daemon {
         }
         let image = presets::resolve(self, &rec.info.preset)?;
         let live = self.boot(&rec, &image.path, Launch::Cold).await?;
+        self.db(|s| s.set_image_digest(&rec.info.id, &image.digest))?;
         self.create_session(&live, Some("shell"), None, 24, 80, None)
             .await?;
         self.set_state(&rec, PocketState::Running)?;
@@ -1541,6 +1539,7 @@ impl Daemon {
         m.hibernation = None;
         self.save_meta(&rec.info.id, &m)?;
         self.set_state(&rec, PocketState::Stopped)?;
+        crate::images::spawn_auto(self);
         Ok(self.info(self.find(&rec.info.name)?))
     }
 
@@ -1584,6 +1583,7 @@ impl Daemon {
             at: now_ms(),
         });
         tracing::info!("{}: removed", rec.info.name);
+        crate::images::spawn_auto(self);
         Ok(())
     }
 

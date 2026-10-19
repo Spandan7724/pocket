@@ -199,5 +199,28 @@ pub fn checks(d: &Daemon) -> Vec<Check> {
             )),
         }
     }
+    if let Ok(list) = crate::images::list(d) {
+        let unused: Vec<_> = list
+            .iter()
+            .filter(|i| !i.current && i.used_by.is_empty())
+            .collect();
+        if !unused.is_empty() {
+            let bytes: u64 = unused.iter().map(|i| i.size_bytes).sum();
+            v.push(warn(
+                "old images",
+                format!(
+                    "{} unused image version(s), {:.1} GiB ({})",
+                    unused.len(),
+                    bytes as f64 / (1u64 << 30) as f64,
+                    if unused.iter().all(|i| i.shared) {
+                        "in POCKET_PRESET_CACHE, which pocket never cleans on its own"
+                    } else {
+                        "left from before automatic cleanup"
+                    }
+                ),
+                "`pocket images` lists them; `pocket gc` removes them",
+            ));
+        }
+    }
     v
 }

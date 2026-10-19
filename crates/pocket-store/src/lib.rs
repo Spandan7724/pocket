@@ -93,6 +93,20 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE templates ADD COLUMN family TEXT NOT NULL DEFAULT '';
     ALTER TABLE templates ADD COLUMN name TEXT;
     ALTER TABLE templates ADD COLUMN meta_json TEXT NOT NULL DEFAULT '{}';",
+    // 3: every built version of an image is a row, so old versions can be found and removed
+    "CREATE TABLE images_v3 (
+        digest TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        path TEXT NOT NULL,
+        source TEXT NOT NULL,
+        built_at INTEGER NOT NULL,
+        size_bytes INTEGER NOT NULL
+    );
+    INSERT OR REPLACE INTO images_v3 (digest, name, path, source, built_at, size_bytes)
+        SELECT digest, name, path, source, built_at, size_bytes FROM images;
+    DROP TABLE images;
+    ALTER TABLE images_v3 RENAME TO images;
+    CREATE INDEX images_name ON images(name);",
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -372,6 +386,14 @@ impl Store {
         Ok(())
     }
 
+    pub fn set_image_digest(&self, id: &str, digest: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE pockets SET image_digest = ?2 WHERE id = ?1",
+            params![id, digest],
+        )?;
+        Ok(())
+    }
+
     pub fn touch(&self, id: &str, now: u64) -> Result<()> {
         self.conn.execute(
             "UPDATE pockets SET last_active_at = ?2 WHERE id = ?1",
@@ -594,25 +616,45 @@ impl Store {
         Ok(())
     }
 
-    pub fn image(&self, name: &str) -> Result<Option<ImageRecord>> {
+    /// One version of an image, by digest.
+    pub fn image(&self, digest: &str) -> Result<Option<ImageRecord>> {
         Ok(self
             .conn
             .query_row(
-                "SELECT name, digest, path, source, built_at, size_bytes FROM images WHERE name = ?1",
-                [name],
-                |r| {
-                    Ok(ImageRecord {
-                        name: r.get(0)?,
-                        digest: r.get(1)?,
-                        path: PathBuf::from(r.get::<_, String>(2)?),
-                        source: r.get(3)?,
-                        built_at: r.get::<_, i64>(4)? as u64,
-                        size_bytes: r.get::<_, i64>(5)? as u64,
-                    })
-                },
+                &format!("SELECT {IMAGE_COLS} FROM images WHERE digest = ?1"),
+                [digest],
+                image_row,
             )
             .optional()?)
     }
+
+    /// Every recorded version of every image, oldest first.
+    pub fn images(&self) -> Result<Vec<ImageRecord>> {
+        let mut st = self.conn.prepare(&format!(
+            "SELECT {IMAGE_COLS} FROM images ORDER BY name, built_at"
+        ))?;
+        let rows = st.query_map([], image_row)?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    pub fn delete_image(&self, digest: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM images WHERE digest = ?1", [digest])?;
+        Ok(())
+    }
+}
+
+const IMAGE_COLS: &str = "name, digest, path, source, built_at, size_bytes";
+
+fn image_row(r: &rusqlite::Row) -> rusqlite::Result<ImageRecord> {
+    Ok(ImageRecord {
+        name: r.get(0)?,
+        digest: r.get(1)?,
+        path: PathBuf::from(r.get::<_, String>(2)?),
+        source: r.get(3)?,
+        built_at: r.get::<_, i64>(4)? as u64,
+        size_bytes: r.get::<_, i64>(5)? as u64,
+    })
 }
 
 #[cfg(test)]
@@ -759,6 +801,32 @@ mod tests {
     }
 
     #[test]
+    fn migration_3_keeps_existing_image_rows() {
+        let dir = std::env::temp_dir().join(format!("pocket-store-m3-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("state.db");
+        {
+            let c = Connection::open(&db).unwrap();
+            for m in &MIGRATIONS[..2] {
+                c.execute_batch(m).unwrap();
+            }
+            c.pragma_update(None, "user_version", 2).unwrap();
+            c.execute(
+                "INSERT INTO images VALUES ('base', 'sha256:1', '/i/b.erofs', 'preset:base', 3, 9)",
+                [],
+            )
+            .unwrap();
+        }
+        let s = Store::open(&db).unwrap();
+        assert_eq!(s.schema_version().unwrap(), 3);
+        let img = s.image("sha256:1").unwrap().unwrap();
+        assert_eq!((img.name.as_str(), img.size_bytes), ("base", 9));
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn images_and_policies() {
         let s = Store::open_in_memory().unwrap();
         s.insert_pocket(&rec("a", 3)).unwrap();
@@ -771,7 +839,22 @@ mod tests {
             size_bytes: 9,
         };
         s.put_image(&img).unwrap();
-        assert_eq!(s.image("base").unwrap(), Some(img));
+        let newer = ImageRecord {
+            digest: "sha256:2".into(),
+            path: "/i/base-2.erofs".into(),
+            built_at: 4,
+            ..img.clone()
+        };
+        s.put_image(&newer).unwrap();
+        assert_eq!(s.image("sha256:1").unwrap(), Some(img.clone()));
+        assert_eq!(s.images().unwrap(), vec![img, newer]);
+        s.delete_image("sha256:1").unwrap();
+        assert_eq!(s.image("sha256:1").unwrap(), None);
+        s.set_image_digest("id-a", "sha256:2").unwrap();
+        assert_eq!(
+            s.pocket("a").unwrap().unwrap().info.image_digest,
+            "sha256:2"
+        );
         let rules = vec![PolicyRule {
             kind: "domain".into(),
             pattern: "*.github.com".into(),
