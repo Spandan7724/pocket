@@ -329,6 +329,8 @@ pub fn fifty() -> App {
 pub fn scene(name: &str) -> Option<App> {
     let key = |a: &mut App, c: KeyCode| {
         a.key(KeyEvent::new(c, KeyModifiers::NONE));
+        // `key` reads the wall clock; scenes stay pinned to NOW.
+        a.now_ms = NOW;
     };
     Some(match name {
         "session" => fleet(Mode::Dark),
